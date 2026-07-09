@@ -1,0 +1,1 @@
+from app.strategies.kaushalcustomWMASMACall1.strategy import KaushalCustomWMASMACall1

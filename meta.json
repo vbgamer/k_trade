@@ -1,0 +1,68 @@
+{
+  "id": "s-nifty-atm-wma5-sma1-open-offsetm1-call",
+  "slug": "kaushalcustomWMASMACall1",
+  "name": "Nifty ATM WMA5/SMA1 Open Offset -1 Call",
+  "timeframeMin": 1,
+  "timeframeOptions": [1, 3, 5, 15, 60],
+  "description": "NIFTY ATM option using Heikin Ashi candles: compute WMA(5) on HA close with offset -1 and SMA(1) on HA open with offset -1. Bullish crossover triggers BUY CE; bearish crossover exits.",
+  "category": "Options",
+  "isCustom": true,
+  "visibility": {
+    "mode": "public"
+  },
+  "strategyType": "Intraday / Options",
+  "supportedExchanges": ["NSEFO"],
+  "supportedIndices": ["NIFTY"],
+
+  "mtm": 0,
+  "orders": 0,
+
+  "price": 0,
+
+  "isFree": false,
+  "rating": 4.4,
+  "reviews": 0,
+  "purchases": 0,
+  "returns": { "monthly": 0.0, "yearly": 0.0 },
+  "risk": "Medium",
+  "winRate": 0,
+  "profitFactor": 0,
+  "maxDrawdown": 0,
+  "timeInMarket": 0,
+  "tradesPerDay": 0,
+  "tags": ["NIFTY", "ATM", "WMA", "SMA", "Crossover", "WMA5", "SMA1", "OPEN", "OFFSET-1", "CALL"],
+  "lastUpdated": "2026-04-30",
+  "isFeatured": false,
+  "featured": false,
+  "isNew": true,
+  "isTrending": false,
+  "chartData": null,
+
+  "creator": {
+    "id": "c5",
+    "name": "ScalpKing",
+    "avatar": "/placeholder.svg?height=40&width=40",
+    "verified": true,
+    "strategies": 4,
+    "followers": 2100
+  },
+
+  "scriptSelectionAllowed": "no",
+  "isMultiLeg": "no",
+
+  "instrument": "NIFTY",
+  "instrumentKey": "NSE_INDEX|Nifty 50",
+  "allowedDays": ["M", "T", "W", "Th", "Fri"],
+  "maxProfit": 0,
+  "maxLoss": 0,
+  "multiplier": 1,
+  "qty": 65,
+
+  "cardMeta": {
+    "exchange": "NSEFO",
+    "minCapital": 50000,
+    "capitalCurrency": "INR"
+  },
+
+  "pnlReport": null
+}
