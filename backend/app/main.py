@@ -95,13 +95,18 @@ manager = ConnectionManager()
 
 # Background task to subscribe to Redis and broadcast events to all open WebSockets
 async def redis_event_bus_listener():
-    redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-    pubsub = redis_client.pubsub()
-    await pubsub.psubscribe("market:candles:*")
-    logger.info("Websocket event bus listener active.")
+    logger.info("Redis event bus listener task started.")
+    pubsub = None
+    redis_client = None
     
     while True:
         try:
+            if redis_client is None:
+                redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+                pubsub = redis_client.pubsub()
+                await pubsub.psubscribe("market:candles:*")
+                logger.info("Websocket event bus listener connected to Redis.")
+                
             msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
             if msg:
                 # Wrap candle closed event in a structured PnL / data broadcast
@@ -116,9 +121,14 @@ async def redis_event_bus_listener():
                     }
                 }
                 await manager.broadcast(json.dumps(event))
+        except (ConnectionError, OSError) as conn_err:
+            logger.warning("Redis Event Bus not reachable. Retrying connection in 5 seconds...")
+            pubsub = None
+            redis_client = None
+            await asyncio.sleep(5)
         except Exception as e:
             logger.error(f"Error in Redis listener thread: {str(e)}")
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
         await asyncio.sleep(0.1)
 
 @app.on_event("startup")
