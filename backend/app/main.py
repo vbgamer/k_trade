@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as aioredis
 
 from app.core.config import settings
-from app.core.database import get_db, async_session_maker
+from app.core.database import get_db, async_session_maker, Base, engine
 from app.db.models import User, UserSession, BrokerCredential, StrategyDefinition, StrategyVersion, StrategySubscription, Position, BrokerOrder
 from app.services.scheduler import StrategyScheduler
 from app.workers.tasks import start_strategy_task
@@ -123,6 +123,10 @@ async def redis_event_bus_listener():
 
 @app.on_event("startup")
 async def startup_event():
+    # Enforce database schema creation on boot
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
     asyncio.create_task(redis_event_bus_listener())
     
     # Pre-populate dynamic strategy definitions if not present
