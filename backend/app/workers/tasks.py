@@ -18,11 +18,36 @@ async def run_strategy_loop(subscription_id: str):
         logger.error(f"Failed to initialize strategy runtime for subscription {subscription_id}.")
         return
         
-    redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-    pubsub = redis_client.pubsub()
+    use_redis = True
+    pubsub = None
+    redis_client = None
     
-    # Subscribe to option & index candles fanning out from the Event Bus
-    await pubsub.psubscribe("market:candles:*")
+    # Try connecting to Redis
+    try:
+        redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+        await redis_client.ping()
+        pubsub = redis_client.pubsub()
+        await pubsub.psubscribe("market:candles:*")
+        logger.info(f"Strategy Runtime connected to Redis Pub/Sub for sub={subscription_id}")
+    except Exception:
+        use_redis = False
+        logger.warning(f"Redis down. Operating in Local Memory-Bus mode for sub={subscription_id}")
+        if redis_client:
+            try:
+                await redis_client.close()
+            except Exception:
+                pass
+            
+    # Set up in-memory message queue fallback
+    memory_queue = asyncio.Queue()
+    
+    async def memory_bus_callback(channel: str, message: str):
+        await memory_queue.put(message)
+        
+    if not use_redis:
+        from app.core.memory_bus import memory_bus
+        memory_bus.subscribe(memory_bus_callback)
+        
     logger.info(f"Strategy Runtime task listener active for subscription={subscription_id}")
     
     try:
@@ -38,11 +63,28 @@ async def run_strategy_loop(subscription_id: str):
                     runtime.active = False
                     break
             
-            # Fetch message from Event Bus
-            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-            if message:
+            message_data = None
+            if use_redis:
                 try:
-                    candle_data = json.loads(message["data"])
+                    message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                    if message:
+                        message_data = message["data"]
+                except Exception:
+                    # Switch to memory bus if Redis connection crashes mid-trade
+                    use_redis = False
+                    from app.core.memory_bus import memory_bus
+                    memory_bus.subscribe(memory_bus_callback)
+                    logger.warning("Lost connection to Redis. Switched to local Memory-Bus.")
+            else:
+                try:
+                    # Read from local asyncio queue with timeout
+                    message_data = await asyncio.wait_for(memory_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+                    
+            if message_data:
+                try:
+                    candle_data = json.loads(message_data)
                     await runtime.process_candle(candle_data)
                 except Exception as eval_err:
                     logger.error(f"Error handling event candle payload: {str(eval_err)}")
@@ -52,9 +94,17 @@ async def run_strategy_loop(subscription_id: str):
     except Exception as run_err:
         logger.error(f"Strategy loop encountered runner error: {str(run_err)}")
     finally:
-        await pubsub.punsubscribe("market:candles:*")
-        await pubsub.close()
-        await redis_client.close()
+        if use_redis:
+            try:
+                await pubsub.punsubscribe("market:candles:*")
+                await pubsub.close()
+                await redis_client.close()
+            except Exception:
+                pass
+        else:
+            from app.core.memory_bus import memory_bus
+            memory_bus.unsubscribe(memory_bus_callback)
+            
         logger.info(f"Strategy Runtime loop closed for subscription={subscription_id}")
 
 @celery_app.task(name="start_strategy_task")

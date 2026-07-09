@@ -19,6 +19,7 @@ from app.core.database import get_db, async_session_maker, Base, engine
 from app.db.models import User, UserSession, BrokerCredential, StrategyDefinition, StrategyVersion, StrategySubscription, Position, BrokerOrder
 from app.services.scheduler import StrategyScheduler
 from app.workers.tasks import start_strategy_task
+from app.core.memory_bus import memory_bus
 # Import strategy to trigger registration
 from app.strategies.kaushalcustomWMASMACall1.strategy import KaushalCustomWMASMACall1
 
@@ -109,7 +110,6 @@ async def redis_event_bus_listener():
                 
             msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
             if msg:
-                # Wrap candle closed event in a structured PnL / data broadcast
                 data = json.loads(msg["data"])
                 event = {
                     "event_type": "TickUpdate",
@@ -121,8 +121,8 @@ async def redis_event_bus_listener():
                     }
                 }
                 await manager.broadcast(json.dumps(event))
-        except (ConnectionError, OSError) as conn_err:
-            logger.warning("Redis Event Bus not reachable. Retrying connection in 5 seconds...")
+        except (ConnectionError, OSError):
+            # Redis unreachable. We operate silently and rely on the Memory Bus callback
             pubsub = None
             redis_client = None
             await asyncio.sleep(5)
@@ -131,11 +131,41 @@ async def redis_event_bus_listener():
             await asyncio.sleep(2)
         await asyncio.sleep(0.1)
 
+# Memory Bus ws callback for local execution fallback
+async def memory_bus_ws_callback(channel: str, message: str):
+    try:
+        data = json.loads(message)
+        event = {
+            "event_type": "TickUpdate",
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "data": {
+                "instrument_key": data["instrument_key"],
+                "ltp": data["close"],
+                "candle": data
+            }
+        }
+        await manager.broadcast(json.dumps(event))
+    except Exception:
+        pass
+
 @app.on_event("startup")
 async def startup_event():
     # Enforce database schema creation on boot
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        
+    # Subscribe websocket gateway to Memory Bus fallback
+    memory_bus.subscribe(memory_bus_ws_callback)
+
+    # Start Market Data Feed Simulator locally inside the API process
+    from app.engine.market_data import MarketDataService
+    mds = MarketDataService(candle_duration_sec=5) # 5-second candles for fast visual testing
+    await mds.connect()
+    await mds.start_stream()
+    
+    # Start local RMS Circuit Breaker daemon
+    from app.engine.rms import RMSService
+    asyncio.create_task(RMSService.run_rms_circuit_breaker(async_session_maker, settings.REDIS_URL))
 
     asyncio.create_task(redis_event_bus_listener())
     
@@ -169,7 +199,6 @@ async def startup_event():
 
 @app.get("/health")
 async def health_check():
-    # Simple dependency checks
     db_ok = True
     try:
         async with async_session_maker() as db:
@@ -185,7 +214,6 @@ async def health_check():
 
 @app.get("/metrics")
 async def prometheus_metrics():
-    # Basic Prometheus exposition output format
     async with async_session_maker() as db:
         res = await db.execute(select(StrategySubscription))
         count = len(res.scalars().all())
@@ -236,11 +264,9 @@ async def save_credentials(payload: Dict[str, Any], user_id: str = Depends(get_c
     api_key = payload.get("api_key")
     client_id = payload.get("client_id")
     
-    # Encrypt inputs
     key_enc = fernet.encrypt(api_key.encode()).decode()
     client_enc = fernet.encrypt(client_id.encode()).decode()
     
-    # Check if credentials exist
     query = select(BrokerCredential).where(BrokerCredential.user_id == user_id, BrokerCredential.broker_name == broker_name)
     result = await db.execute(query)
     cred = result.scalar_one_or_none()
@@ -268,7 +294,6 @@ async def get_strategies(db: AsyncSession = Depends(get_db)):
     
     out = []
     for s in strategies:
-        # Load versions
         v_query = select(StrategyVersion).where(StrategyVersion.strategy_definition_id == s.id)
         v_res = await db.execute(v_query)
         versions = v_res.scalars().all()
@@ -317,9 +342,7 @@ async def toggle_strategy(id: str, payload: Dict[str, Any], user_id: str = Depen
         raise HTTPException(status_code=404, detail="Subscription not found")
         
     if active:
-        # Check market timings scheduler constraint
         if not StrategyScheduler.is_market_open():
-            # For local testing, allow bypassing this constraint if config_json contains bypass_scheduler
             bypass = (sub.config_json or {}).get("bypass_scheduler", False)
             if not bypass:
                 raise HTTPException(status_code=400, detail="Cannot start strategy. Markets are closed.")
@@ -327,8 +350,15 @@ async def toggle_strategy(id: str, payload: Dict[str, Any], user_id: str = Depen
         sub.status = "running"
         await db.commit()
         
-        # Enqueue start command task in RabbitMQ Worker Queue
-        start_strategy_task.delay(sub.id)
+        # Enqueue start command task in Celery worker (RabbitMQ)
+        try:
+            start_strategy_task.delay(sub.id)
+            logger.info(f"Strategy enqueued in Celery worker for sub={sub.id}")
+        except Exception as celery_err:
+            logger.warning(f"RabbitMQ/Celery connection failed. Running locally inside FastAPI loop: {str(celery_err)}")
+            from app.workers.tasks import run_strategy_loop
+            # Spawn strategy task directly inside the FastAPI loop
+            asyncio.create_task(run_strategy_loop(sub.id))
         
         # Broadcast event
         event = {
@@ -353,7 +383,6 @@ async def toggle_strategy(id: str, payload: Dict[str, Any], user_id: str = Depen
 
 @app.get("/api/v1/portfolio/positions")
 async def get_positions(user_id: str = Depends(get_current_user_id), db: AsyncSession = Depends(get_db)):
-    # Fetch positions for all subscriptions of this user
     query = select(Position).join(StrategySubscription).where(StrategySubscription.user_id == user_id)
     result = await db.execute(query)
     positions = result.scalars().all()
@@ -375,7 +404,6 @@ async def ws_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            # Keep connection alive
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
@@ -385,4 +413,3 @@ from fastapi.staticfiles import StaticFiles
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.exists(static_dir):
     app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
-

@@ -6,6 +6,7 @@ import redis.asyncio as aioredis
 from typing import Dict, Any, List, Optional
 from app.engine.registry import BaseStrategy, StrategyRegistry
 from app.core.config import settings
+from app.core.memory_bus import in_memory_candles
 
 logger = logging.getLogger("strategy_kaushal")
 
@@ -91,85 +92,94 @@ class KaushalCustomWMASMACall1(BaseStrategy):
     ) -> Optional[Dict[str, Any]]:
         instrument_key = candle_data["instrument_key"]
         
-        # 1. Load historical closed candles from Redis cache
-        redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+        # 1. Load historical closed candles (try Redis, fallback to Memory Bus)
+        candles = []
+        use_fallback = False
         try:
+            redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
             cache_key = f"candles:{instrument_key}"
             raw_candles = await redis_client.lrange(cache_key, 0, 199)
-            if len(raw_candles) < max(self.wma_close_period, self.sma_open_period) + 5:
-                return None
-                
-            candles = [json.loads(c) for c in raw_candles]
-            chrono_candles = candles[::-1]  # Chronological order
-            
-            o = [float(x["open"]) for x in chrono_candles]
-            h = [float(x["high"]) for x in chrono_candles]
-            l = [float(x["low"]) for x in chrono_candles]
-            cl = [float(x["close"]) for x in chrono_candles]
-            
-            # 2. Heikin-Ashi Indicator Transformation
-            ha_o, ha_h, ha_l, ha_c = self._compute_heikin_ashi(o, h, l, cl)
-            
-            # 3. Indicator calculations
-            wma_close = self._wma(ha_c, self.wma_close_period)
-            sma_open = self._sma(ha_o, self.sma_open_period)
-            
-            idx = len(cl) - 1
-            prev_idx = idx - 1
-            
-            # Apply offset -1
-            wma_close_val = wma_close[idx - 1]
-            wma_close_prev_val = wma_close[prev_idx - 1]
-            sma_open_val = sma_open[idx - 1]
-            sma_open_prev_val = sma_open[prev_idx - 1]
-            
-            if None in [wma_close_val, wma_close_prev_val, sma_open_val, sma_open_prev_val]:
-                return None
-                
-            # Crossover Checks
-            bullish_cross = (wma_close_prev_val <= sma_open_prev_val) and (wma_close_val > sma_open_val)
-            bearish_cross = (wma_close_prev_val >= sma_open_prev_val) and (wma_close_val < sma_open_val)
-            
-            in_trade = len(open_positions) > 0
-            
-            # Check market time cut-offs (auto-flatten at 15:30 IST)
-            ist_now = datetime.datetime.now(self.ist)
-            if ist_now.hour >= 15 and ist_now.minute >= 30:
-                if in_trade:
-                    logger.info("Cutoff limit reached. Exiting positions.")
-                    return {
-                        "action": "SELL",
-                        "instrument_key": open_positions[0]["instrument_key"],
-                        "quantity": abs(open_positions[0]["quantity"]),
-                        "product_type": self.product_type,
-                        "trading_symbol": open_positions[0]["trading_symbol"]
-                    }
-                return None
-
-            if in_trade:
-                active_pos = open_positions[0]
-                if bearish_cross and active_pos["quantity"] > 0:
-                    return {
-                        "action": "SELL",
-                        "instrument_key": active_pos["instrument_key"],
-                        "quantity": abs(active_pos["quantity"]),
-                        "product_type": self.product_type,
-                        "trading_symbol": active_pos["trading_symbol"]
-                    }
-            else:
-                if bullish_cross:
-                    symbol = instrument_key.split("|")[-1]
-                    return {
-                        "action": "BUY",
-                        "instrument_key": instrument_key,
-                        "quantity": self.qty,
-                        "product_type": self.product_type,
-                        "trading_symbol": symbol
-                    }
-                    
-        finally:
             await redis_client.close()
+            if raw_candles:
+                candles = [json.loads(c) for c in raw_candles]
+            else:
+                use_fallback = True
+        except Exception:
+            use_fallback = True
             
+        if use_fallback:
+            candles = in_memory_candles.get(instrument_key, [])
+            
+        if len(candles) < max(self.wma_close_period, self.sma_open_period) + 5:
+            return None
+            
+        chrono_candles = candles[::-1]  # Chronological order
+        
+        o = [float(x["open"]) for x in chrono_candles]
+        h = [float(x["high"]) for x in chrono_candles]
+        l = [float(x["low"]) for x in chrono_candles]
+        cl = [float(x["close"]) for x in chrono_candles]
+        
+        # 2. Heikin-Ashi Indicator Transformation
+        ha_o, ha_h, ha_l, ha_c = self._compute_heikin_ashi(o, h, l, cl)
+        
+        # 3. Indicator calculations
+        wma_close = self._wma(ha_c, self.wma_close_period)
+        sma_open = self._sma(ha_o, self.sma_open_period)
+        
+        idx = len(cl) - 1
+        prev_idx = idx - 1
+        
+        # Apply offset -1
+        wma_close_val = wma_close[idx - 1]
+        wma_close_prev_val = wma_close[prev_idx - 1]
+        sma_open_val = sma_open[idx - 1]
+        sma_open_prev_val = sma_open[prev_idx - 1]
+        
+        if None in [wma_close_val, wma_close_prev_val, sma_open_val, sma_open_prev_val]:
+            return None
+            
+        # Crossover Checks
+        bullish_cross = (wma_close_prev_val <= sma_open_prev_val) and (wma_close_val > sma_open_val)
+        bearish_cross = (wma_close_prev_val >= sma_open_prev_val) and (wma_close_val < sma_open_val)
+        
+        in_trade = len(open_positions) > 0
+        
+        # Check market time cut-offs (auto-flatten at 15:30 IST)
+        ist_now = datetime.datetime.now(self.ist)
+        if ist_now.hour >= 15 and ist_now.minute >= 30:
+            if in_trade:
+                logger.info("Cutoff limit reached. Exiting positions.")
+                return {
+                    "action": "SELL",
+                    "instrument_key": open_positions[0]["instrument_key"],
+                    "quantity": abs(open_positions[0]["quantity"]),
+                    "product_type": self.product_type,
+                    "trading_symbol": open_positions[0]["trading_symbol"]
+                }
+            return None
+
+        if in_trade:
+            active_pos = open_positions[0]
+            if bearish_cross and active_pos["quantity"] > 0:
+                return {
+                    "action": "SELL",
+                    "instrument_key": active_pos["instrument_key"],
+                    "quantity": abs(active_pos["quantity"]),
+                    "product_type": self.product_type,
+                    "trading_symbol": active_pos["trading_symbol"]
+                }
+        else:
+            if bullish_cross:
+                symbol = instrument_key.split("|")[-1]
+                return {
+                    "action": "BUY",
+                    "instrument_key": instrument_key,
+                    "quantity": self.qty,
+                    "product_type": self.product_type,
+                    "trading_symbol": symbol
+                }
+                
         return None
 
 # Register to the Global Strategies Catalog Registry
