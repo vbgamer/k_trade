@@ -20,6 +20,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy backend files
 COPY backend/app/ ./app/
+COPY backend/alembic.ini ./
+COPY backend/migrations/ ./migrations/
 
 # Copy React bundle from Stage 1 into FastAPI static files folder
 COPY --from=frontend-builder /frontend/dist ./app/static/

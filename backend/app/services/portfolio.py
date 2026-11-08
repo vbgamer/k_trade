@@ -43,6 +43,7 @@ async def update_position(
         # Determine if we are closing/reducing or opening/adding
         same_direction = (old_qty >= 0 and qty_change >= 0) or (old_qty <= 0 and qty_change <= 0)
         
+        trade_realized = 0.0
         if same_direction:
             # Weighted average price update
             total_qty = abs(old_qty) + quantity
@@ -58,7 +59,8 @@ async def update_position(
             
             pnl_direction = 1.0 if old_qty > 0 else -1.0
             realized = closed_qty * (execution_price - old_avg) * pnl_direction
-            position.realized_pnl = round(position.realized_pnl + realized, 2)
+            trade_realized = round(realized, 2)
+            position.realized_pnl = round(position.realized_pnl + trade_realized, 2)
             
             position.quantity = new_qty
             
@@ -70,7 +72,9 @@ async def update_position(
             elif (old_qty > 0 and new_qty < 0) or (old_qty < 0 and new_qty > 0):
                 position.average_price = execution_price
 
-    return position
+        return position, trade_realized
+
+    return position, 0.0
 
 async def recalculate_unrealized_pnl(
     db: AsyncSession,

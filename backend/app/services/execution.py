@@ -3,8 +3,9 @@ from typing import Dict, Any, Optional
 from datetime import datetime
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.db.models import BrokerOrder, Trade, StrategySubscription
+from app.db.models import BrokerOrder, Trade, StrategySubscription, User, Position
 from app.broker.mock_live_adapter import MockLiveAdapter
+from app.engine.rms import RMSService
 from app.services.audit import log_audit
 from app.services.portfolio import update_position
 
@@ -26,7 +27,10 @@ class ExecutionService:
         order_type: str = "MARKET",
         limit_price: Optional[float] = None,
         product_type: str = "MIS",
-        trading_symbol: Optional[str] = None
+        trading_symbol: Optional[str] = None,
+        entry_price: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        target: Optional[float] = None
     ) -> Dict[str, Any]:
         """
         Deduplicates, validates, logs, and executes orders to the exchange.
@@ -54,6 +58,58 @@ class ExecutionService:
         user_id = subscription.user_id
         symbol = trading_symbol or instrument_key.split("|")[-1]
 
+        # 2b. Pre-trade RMS gate
+        pos_res = await self.db.execute(
+            select(Position).where(Position.strategy_subscription_id == subscription_id, Position.quantity != 0)
+        )
+        open_positions = [
+            {"instrument_key": p.instrument_key, "quantity": p.quantity} for p in pos_res.scalars().all()
+        ]
+        day_stats = await RMSService.load_day_stats(self.db, subscription_id)
+        decision = RMSService.evaluate_pre_trade(
+            subscription,
+            side,
+            quantity,
+            open_positions,
+            instrument_key=instrument_key,
+            day_stats=day_stats,
+            entry_price=entry_price if entry_price is not None else limit_price,
+            stop_loss=stop_loss,
+            target=target,
+        )
+        if not decision.allowed:
+            reason = f"RMS: {decision.reason}"
+            logger.warning(f"RMS Reject sub={subscription_id} client_order_id={client_order_id}: {decision.reason}")
+            # Persist the rejected order so the idempotency check also covers retries of blocked signals
+            self.db.add(BrokerOrder(
+                strategy_subscription_id=subscription_id,
+                client_order_id=client_order_id,
+                side=side,
+                instrument_key=instrument_key,
+                order_type=order_type,
+                quantity=quantity,
+                product_type=product_type,
+                status="REJECTED",
+                rejection_reason=reason[:255]
+            ))
+            await self.db.commit()
+            await log_audit(
+                db=self.db,
+                user_id=user_id,
+                event_type="RMS_PRE_TRADE_REJECTED",
+                message=f"Blocked {side} {quantity} of {symbol}: {decision.reason}",
+                metadata_json={
+                    "client_order_id": client_order_id,
+                    "entries_today": day_stats.entries_today,
+                    "realized_pnl_today": day_stats.realized_pnl_today,
+                }
+            )
+            return {"ok": False, "status": "REJECTED", "rejection_reason": reason}
+
+        # Determine trading segment
+        is_fno = "OPTION" in instrument_key or "NIFTY" in instrument_key or "BANKNIFTY" in instrument_key or "FUT" in instrument_key
+        segment = "FNO" if is_fno else ("INTRADAY" if product_type == "MIS" else "EQUITY")
+
         # 3. Create Pending BrokerOrder in database
         order = BrokerOrder(
             strategy_subscription_id=subscription_id,
@@ -63,6 +119,7 @@ class ExecutionService:
             order_type=order_type,
             quantity=quantity,
             product_type=product_type,
+            segment=segment,
             status="PENDING"
         )
         self.db.add(order)
@@ -74,7 +131,7 @@ class ExecutionService:
             db=self.db,
             user_id=user_id,
             event_type="ORDER_DISPATCHED",
-            message=f"Dispatched {side} order for {quantity} qty of {symbol}",
+            message=f"Dispatched {side} order for {quantity} qty of {symbol} [{segment}]",
             broker_order_id=None,
             metadata_json={"client_order_id": client_order_id}
         )
@@ -103,18 +160,8 @@ class ExecutionService:
                 order.broker_order_id = broker_order_id
                 order.status = "FILLED"
                 
-                # Write trade detail record
-                trade = Trade(
-                    broker_order_id=order.id,
-                    execution_price=fill_price,
-                    quantity=quantity,
-                    slippage=slippage,
-                    brokerage_fees=brokerage_fees
-                )
-                self.db.add(trade)
-                
-                # Trigger Portfolio Service positions adjustments
-                await update_position(
+                # Trigger Portfolio Service positions adjustments & compute realized P&L
+                pos, trade_realized = await update_position(
                     db=self.db,
                     subscription_id=subscription_id,
                     instrument_key=instrument_key,
@@ -123,7 +170,25 @@ class ExecutionService:
                     quantity=quantity,
                     execution_price=fill_price
                 )
+
+                # Write trade detail record
+                trade = Trade(
+                    broker_order_id=order.id,
+                    trading_symbol=symbol,
+                    execution_price=fill_price,
+                    quantity=quantity,
+                    slippage=slippage,
+                    brokerage_fees=brokerage_fees,
+                    realized_pnl=trade_realized
+                )
+                self.db.add(trade)
                 
+                # Update user virtual balance if trade has realized P&L or charges
+                u_res = await self.db.execute(select(User).where(User.id == user_id))
+                u = u_res.scalar_one_or_none()
+                if u:
+                    u.virtual_balance = round(u.virtual_balance + trade_realized - brokerage_fees, 2)
+
                 await self.db.commit()
                 
                 # Audit Filled Status

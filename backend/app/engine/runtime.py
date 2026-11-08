@@ -5,8 +5,9 @@ from typing import Dict, Any, List, Optional
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.engine.registry import StrategyRegistry
-from app.db.models import StrategySubscription, Position
+from app.db.models import StrategySubscription, StrategyVersion, StrategyDefinition, Position
 from app.services.execution import ExecutionService
+from app.engine.rms import is_exit_order, size_from_risk
 
 logger = logging.getLogger("runtime")
 
@@ -37,7 +38,7 @@ class StrategyRuntime:
                 return False
                 
             # Load version details
-            version_query = select(sub.version.__class__).where(sub.version.__class__.id == sub.strategy_version_id)
+            version_query = select(StrategyVersion).where(StrategyVersion.id == sub.strategy_version_id)
             version_res = await db.execute(version_query)
             version = version_res.scalar_one_or_none()
             if not version:
@@ -45,7 +46,7 @@ class StrategyRuntime:
                 return False
                 
             # Fetch definition slug
-            def_query = select(version.definition.__class__).where(version.definition.__class__.id == version.strategy_definition_id)
+            def_query = select(StrategyDefinition).where(StrategyDefinition.id == version.strategy_definition_id)
             def_res = await db.execute(def_query)
             definition = def_res.scalar_one_or_none()
             if not definition:
@@ -126,7 +127,23 @@ class StrategyRuntime:
             instrument_key = signal_intent.get("instrument_key")
             quantity = signal_intent.get("quantity", self.strategy_instance.parameters.get("quantity", 50))
             product_type = signal_intent.get("product_type", self.strategy_instance.parameters.get("product_type", "MIS"))
-            
+            entry_price = signal_intent.get("entry_price")
+            stop_loss = signal_intent.get("stop_loss")
+            target = signal_intent.get("target")
+
+            # Risk-based sizing: when the signal carries a stop and the subscription sets
+            # risk_per_trade, size so a stop-out loses at most that amount (exits keep their size)
+            params = self.strategy_instance.parameters
+            risk_per_trade = float(params.get("risk_per_trade") or 0)
+            if risk_per_trade > 0 and entry_price is not None and stop_loss is not None \
+                    and not is_exit_order(action, quantity, instrument_key, open_positions_map):
+                quantity = size_from_risk(risk_per_trade, entry_price, stop_loss, int(params.get("lot_size") or 1))
+                if quantity <= 0:
+                    logger.warning(
+                        f"Skipping signal for sub={self.subscription_id}: one lot risks more than {risk_per_trade}"
+                    )
+                    return
+
             # 3. Create unique Idempotency Client Order ID
             # Structure: co_<sub_id>_<candle_timestamp_formatted>_<buy/sell>
             clean_ts = str(candle_ts).replace(":", "").replace("-", "").replace(" ", "")
@@ -143,5 +160,8 @@ class StrategyRuntime:
                 quantity=quantity,
                 client_order_id=client_order_id,
                 product_type=product_type,
-                trading_symbol=signal_intent.get("trading_symbol")
+                trading_symbol=signal_intent.get("trading_symbol"),
+                entry_price=entry_price,
+                stop_loss=stop_loss,
+                target=target
             )

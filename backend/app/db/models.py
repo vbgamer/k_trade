@@ -16,6 +16,7 @@ class User(Base):
     first_name = Column(String(100), nullable=True)
     last_name = Column(String(100), nullable=True)
     is_active = Column(Boolean, default=True)
+    virtual_balance = Column(Float, default=500000.0)  # Paper Trading Margin
     created_at = Column(DateTime, default=datetime.utcnow)
     
     sessions = relationship("UserSession", back_populates="user", cascade="all, delete-orphan")
@@ -125,6 +126,7 @@ class BrokerOrder(Base):
     order_type = Column(String(20), default="MARKET")  # MARKET, LIMIT
     quantity = Column(Integer, nullable=False)
     product_type = Column(String(20), default="MIS")  # MIS, NRML
+    segment = Column(String(50), default="FNO")  # INTRADAY, FNO
     status = Column(String(50), default="PENDING")  # PENDING, FILLED, REJECTED, CANCELLED
     rejection_reason = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -138,10 +140,12 @@ class Trade(Base):
     
     id = Column(String(36), primary_key=True, default=generate_uuid)
     broker_order_id = Column(String(36), ForeignKey("broker_orders.id", ondelete="CASCADE"), nullable=False)
+    trading_symbol = Column(String(100), nullable=True)
     execution_price = Column(Float, nullable=False)
     quantity = Column(Integer, nullable=False)
     slippage = Column(Float, default=0.0)
     brokerage_fees = Column(Float, default=0.0)
+    realized_pnl = Column(Float, default=0.0)
     executed_at = Column(DateTime, default=datetime.utcnow)
     
     order = relationship("BrokerOrder", back_populates="trades")

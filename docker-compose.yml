@@ -7,10 +7,10 @@ services:
     restart: always
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: options_trading
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
@@ -19,15 +19,15 @@ services:
     container_name: options_redis
     restart: always
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
 
   rabbitmq:
     image: rabbitmq:3-management-alpine
     container_name: options_rabbitmq
     restart: always
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
 
   api:
     build:
@@ -37,12 +37,11 @@ services:
     restart: always
     ports:
       - "8000:8000"
+    env_file: backend/.env  # SECRET_KEY, ENCRYPTION_KEY, CORS_ORIGINS, ...
     environment:
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgrespassword@db:5432/options_trading
+      - DATABASE_URL=postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/options_trading
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672//
       - REDIS_URL=redis://redis:6379/0
-      - SECRET_KEY=9ca7688267df88e99e4cb2e64dcfa82e88a3857d4a6bb4cb4a8f94d13bfdc9e9
-      - ENCRYPTION_KEY=h8m3n8L5d_5rV-Fj1K3Pz9OqP7L9wN3mK5L8J9R3f2U=
     depends_on:
       - db
       - redis
@@ -55,12 +54,11 @@ services:
     container_name: options_worker
     command: celery -A app.workers.celery_app worker --loglevel=info
     restart: always
+    env_file: backend/.env  # SECRET_KEY, ENCRYPTION_KEY, CORS_ORIGINS, ...
     environment:
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgrespassword@db:5432/options_trading
+      - DATABASE_URL=postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/options_trading
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672//
       - REDIS_URL=redis://redis:6379/0
-      - SECRET_KEY=9ca7688267df88e99e4cb2e64dcfa82e88a3857d4a6bb4cb4a8f94d13bfdc9e9
-      - ENCRYPTION_KEY=h8m3n8L5d_5rV-Fj1K3Pz9OqP7L9wN3mK5L8J9R3f2U=
     depends_on:
       - db
       - redis
@@ -73,12 +71,11 @@ services:
     container_name: options_beat
     command: celery -A app.workers.celery_app beat --loglevel=info
     restart: always
+    env_file: backend/.env  # SECRET_KEY, ENCRYPTION_KEY, CORS_ORIGINS, ...
     environment:
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgrespassword@db:5432/options_trading
+      - DATABASE_URL=postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/options_trading
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672//
       - REDIS_URL=redis://redis:6379/0
-      - SECRET_KEY=9ca7688267df88e99e4cb2e64dcfa82e88a3857d4a6bb4cb4a8f94d13bfdc9e9
-      - ENCRYPTION_KEY=h8m3n8L5d_5rV-Fj1K3Pz9OqP7L9wN3mK5L8J9R3f2U=
     depends_on:
       - redis
       - rabbitmq

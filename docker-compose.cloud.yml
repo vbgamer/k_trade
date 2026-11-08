@@ -1,0 +1,57 @@
+# Single-server cloud deployment: Postgres + API + Caddy (automatic HTTPS).
+# Strategies run inside the API process, so Redis/RabbitMQ/Celery are not needed here.
+# Setup steps: docs/DEPLOY_CLOUD.md
+#
+#   docker compose -f docker-compose.cloud.yml up -d --build
+
+services:
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: options_trading
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d options_trading"]
+      interval: 5s
+      retries: 10
+    # No published ports: only reachable from the api container
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: backend/.env  # SECRET_KEY, ENCRYPTION_KEY, ALLOW_REGISTRATION, ...
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=postgresql+asyncpg://postgres:${POSTGRES_PASSWORD}@db:5432/options_trading
+      - RUN_STRATEGIES_IN_PROCESS=true
+      - CORS_ORIGINS=https://${DOMAIN:?set DOMAIN in .env}
+    depends_on:
+      db:
+        condition: service_healthy
+    # Single uvicorn worker on purpose: in-process strategy loops must not be duplicated
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMAIN=${DOMAIN}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:

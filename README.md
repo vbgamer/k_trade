@@ -57,47 +57,85 @@ graph TD
 
 ## 2. Key Modules & Directory Structure
 
-*   **`backend/app/core/`**: System configuration properties (`config.py`) and database engine initialization (`database.py`).
-*   **`backend/app/db/`**: Core SQLAlchemy definitions for relational tables (`models.py`).
-*   **`backend/app/broker/`**: Enforces a generic broker adapter blueprint (`base_adapter.py`) and includes a high-fidelity simulator (`mock_live_adapter.py`).
-*   **`backend/app/services/`**:
-    *   `execution.py`: Order validation, deduplication (idempotency key checks), and routing.
-    *   `portfolio.py`: Position tracker, average fill pricing math, and unrealized/realized P&L calculations.
-    *   `audit.py`: Logs immutable audits to SQL tables.
-    *   `notifications.py`: Dispatches Email, Telegram, and Push notification alerts.
-*   **`backend/app/engine/`**:
-    *   `registry.py`: Abstract class mapping and dynamic strategy loaders.
-    *   `runtime.py`: Generic strategy runtime host that evaluates crossover triggers.
-    *   `market_data.py`: Ticks aggregator and Redis Pub/Sub candle event publisher.
-    *   `rms.py`: Independent portfolio circuit breaker.
-*   **`backend/app/workers/`**: Celery tasks configurations (`celery_app.py`) and loop tasks (`tasks.py`).
-*   **`backend/app/main.py`**: FastAPI routing, auth session handlers, and real-time WebSockets streaming.
-*   **`frontend/`**: Vite + React single page client styled with outrun glassmorphism raw CSS.
+The project has been organized with clear separation of concerns:
+
+```
+Om Project/
+├── backend/                              # Complete Backend Engine & Services
+│   ├── app/                              # FastAPI Gateway, DB Models, Services & Engine
+│   │   ├── broker/                       # Broker adapters (Paper Trading, Shoonya, Kite)
+│   │   ├── core/                         # Config, DB connections, memory bus
+│   │   ├── db/                           # SQLAlchemy relational models
+│   │   ├── engine/                       # Execution engine, RMS, market data feed
+│   │   ├── services/                     # Execution, portfolio math, audits, notifications
+│   │   ├── strategies/                   # Registered active strategy plugins
+│   │   ├── workers/                      # Celery worker tasks
+│   │   ├── static/                       # Compiled production frontend build
+│   │   └── main.py                       # FastAPI application & WebSocket gateway
+│   ├── logics/                           # Quantitative Algorithmic Trading Logics
+│   │   ├── nifty_wma5_sma1_call/         # Nifty ATM Call (WMA 5 / SMA 1) strategy & metadata
+│   │   └── nifty_wma5_sma2_put/          # Nifty ATM Put (WMA 5 / SMA 2) strategy & metadata
+│   ├── scripts/                          # Operational & Utility Scripts
+│   │   ├── seed_demo_data.py             # Seeds paper margin, demo users & past trades
+│   │   ├── simulate_market_ticks.py      # Simulated real-time market ticks
+│   │   └── verify_system.py              # Automated system diagnostics check
+│   ├── docs/                             # System Architecture & Design Documents
+│   ├── tests/                            # Unit & Integration validation tests
+│   ├── manage.py                         # CLI Command Manager (runserver, seed, test, worker)
+│   ├── requirements.txt                  # Python dependencies
+│   └── trading.db                        # SQLite local development database
+│
+└── frontend/                             # React + Vite Single Page Application
+    ├── src/
+    │   ├── App.jsx                       # AlgoTrade Pro UI, Segment Selector & P&L Dashboard
+    │   ├── index.css                     # Outrun Glassmorphic design styles & animations
+    │   └── main.jsx                      # React entrypoint
+    ├── package.json                      # Frontend dependencies
+    └── vite.config.js                    # Vite configuration
+```
 
 ---
 
 ## 3. Local Installation & Run Guide
 
-### Option A: Complete Docker Compose Deployment (Recommended)
-This runs the API gateway, Postgres database, Redis cache, RabbitMQ queue, Celery worker nodes, and the React web dashboard simultaneously:
+### Option A: Using `manage.py` (Quickest Developer Experience)
 
-```bash
-docker-compose up --build
-```
+1. **Activate Virtual Environment & Install Requirements**:
+   ```bash
+   cd backend
+   .\venv\Scripts\activate   # On Windows (or source venv/bin/activate on Linux/Mac)
+   pip install -r requirements.txt
+   ```
 
-Access points:
-*   **React Dashboard UI**: `http://localhost:8000`
-*   **FastAPI API Docs (Swagger)**: `http://localhost:8000/docs`
-*   **RabbitMQ Dashboard**: `http://localhost:15672` (Username/Password: `guest` / `guest`)
+2. **Create your `.env` with fresh secrets (first time only)**:
+   ```bash
+   python manage.py genkeys    # writes backend/.env from .env.example; never commit it
+   ```
+   Database migrations run automatically when the server starts. To run them by hand: `python manage.py migrate`.
+   After changing models: `python manage.py makemigrations -m "describe change"`.
 
-### Option B: Local Developer Mode
-1.  **Run Redis and RabbitMQ** locally on standard ports (`6379` and `5672`).
-2.  **Start Backend API**:
-    ```bash
-    cd backend
-    pip install -r requirements.txt
-    uvicorn app.main:app --reload --port 8000
-    ```
+3. **Run Backend Server (with auto-reload)**:
+   ```bash
+   python manage.py runserver
+   ```
+   *Dashboard and API:*
+   - **Frontend UI**: [http://127.0.0.1:8000/](http://127.0.0.1:8000/)
+   - **Interactive API Docs (Swagger)**: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+
+3. **Useful Management Commands**:
+   ```bash
+   python manage.py seed       # Seeds paper margin (Rs. 5,00,000) & demo trades
+   python manage.py test       # Runs validation test suite
+   python manage.py routes     # Displays all registered API gateway routes
+   python manage.py worker     # Launches background Celery worker
+   ```
+
+4. **Frontend Development Server (Optional for hot module replacement)**:
+   ```bash
+   cd frontend
+   npm install
+   npm run dev
+   ```
 3.  **Start Celery Worker Node**:
     ```bash
     cd backend
@@ -109,6 +147,11 @@ Access points:
     npm install
     npm run dev
     ```
+
+### Cloud server (control from your phone)
+
+To run the platform all day without your laptop, deploy it to a small VM with HTTPS using
+`docker-compose.cloud.yml`. Step-by-step guide: [docs/DEPLOY_CLOUD.md](docs/DEPLOY_CLOUD.md).
 
 ---
 

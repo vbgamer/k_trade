@@ -1,0 +1,6 @@
+# Caddy fetches and renews a Let's Encrypt certificate for $DOMAIN automatically.
+# WebSocket upgrades (/api/v1/ws/stream) are proxied without extra config.
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy api:8000
+}

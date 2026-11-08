@@ -84,3 +84,191 @@ body {
 .pulse-glow {
   animation: pulse-cyan 2s infinite ease-in-out;
 }
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.shimmer-badge {
+  background: linear-gradient(90deg, rgba(239, 68, 68, 0.15) 0%, rgba(245, 158, 11, 0.3) 50%, rgba(239, 68, 68, 0.15) 100%);
+  background-size: 200% 100%;
+  animation: shimmer 3s infinite linear;
+}
+
+/* Badges & Pills */
+.badge-active {
+  background: rgba(16, 185, 129, 0.15);
+  color: #10b981;
+  border: 1px solid rgba(16, 185, 129, 0.4);
+  padding: 3px 8px;
+  border-radius: 9999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.badge-upcoming {
+  background: rgba(245, 158, 11, 0.12);
+  color: #f59e0b;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  padding: 3px 8px;
+  border-radius: 9999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.badge-fno {
+  background: rgba(139, 92, 246, 0.15);
+  color: #c084fc;
+  border: 1px solid rgba(139, 92, 246, 0.4);
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.badge-intraday {
+  background: rgba(6, 182, 212, 0.15);
+  color: #06b6d4;
+  border: 1px solid rgba(6, 182, 212, 0.4);
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.badge-buy {
+  background: rgba(16, 185, 129, 0.15);
+  color: #10b981;
+  border: 1px solid rgba(16, 185, 129, 0.4);
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-weight: 700;
+  font-size: 0.75rem;
+}
+
+.badge-sell {
+  background: rgba(239, 68, 68, 0.15);
+  color: #ef4444;
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-weight: 700;
+  font-size: 0.75rem;
+}
+
+/* Custom Trade Table Styles */
+.trade-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 0.88rem;
+}
+
+.trade-table th {
+  padding: 12px 14px;
+  color: var(--color-text-muted);
+  font-weight: 600;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.trade-table td {
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  color: #e5e7eb;
+}
+
+.trade-table tr:hover td {
+  background: rgba(139, 92, 246, 0.06);
+}
+
+/* Segment Pill Selector */
+.segment-card {
+  cursor: pointer;
+  padding: 14px 18px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(15, 10, 25, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  transition: all 0.25s ease;
+}
+
+.segment-card:hover:not(.locked) {
+  border-color: var(--color-cyan);
+  background: rgba(6, 182, 212, 0.1);
+  transform: translateY(-2px);
+}
+
+.segment-card.selected {
+  border-color: var(--color-cyan);
+  background: rgba(6, 182, 212, 0.12);
+  box-shadow: var(--shadow-neon-cyan);
+}
+
+.segment-card.locked {
+  cursor: not-allowed;
+  opacity: 0.65;
+  background: rgba(10, 7, 18, 0.4);
+}
+
+.segment-card.locked:hover {
+  border-color: rgba(245, 158, 11, 0.4);
+}
+
+/* Phone & small-tablet layout. !important is needed to override the inline grid styles in App.jsx */
+@media (max-width: 768px) {
+  .app-header {
+    margin: 10px !important;
+    padding: 12px 14px !important;
+  }
+
+  .app-nav {
+    order: 10;
+    width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .app-nav button {
+    flex: 0 0 auto;
+    white-space: nowrap;
+    padding: 10px 14px !important;
+  }
+
+  .app-section {
+    margin: 0 10px 12px 10px !important;
+  }
+
+  .app-main {
+    padding: 0 10px 16px 10px !important;
+  }
+
+  .layout-dashboard,
+  .layout-stats {
+    grid-template-columns: 1fr !important;
+    gap: 14px !important;
+  }
+
+  .trade-table th,
+  .trade-table td {
+    padding: 10px 8px;
+    white-space: nowrap;
+  }
+
+  /* 16px inputs stop iOS Safari from zooming in on focus */
+  input,
+  select {
+    font-size: 16px !important;
+  }
+}
