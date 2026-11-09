@@ -39,6 +39,7 @@ from app.strategies.kaushalcustomWMASMACall1.strategy import KaushalCustomWMASMA
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # the market feed polls Upstox every 2s; keep request lines out of the logs
 logger = logging.getLogger("api_gateway")
 
 app = FastAPI(

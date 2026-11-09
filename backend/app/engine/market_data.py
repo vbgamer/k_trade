@@ -122,7 +122,7 @@ class MarketDataService:
     # --- Live (Upstox) --------------------------------------------------------
 
     async def _refresh_chain(self, client: UpstoxClient):
-        today = date.today()
+        today = datetime.now(upstox_session.IST).date()  # exchange date, not the server's UTC date
         if self._contracts_day != today or not self._contracts:
             self._contracts = await client.get_option_contracts(NIFTY_INDEX_KEY)
             self._contracts_day = today
