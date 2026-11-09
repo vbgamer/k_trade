@@ -42,6 +42,17 @@ class Settings(BaseSettings):
     # Set false on a public server once your own account exists, so strangers cannot sign up
     ALLOW_REGISTRATION: bool = True
 
+    # Upstox market data (free with an Upstox account). Leave empty to use the price simulator.
+    UPSTOX_API_KEY: str = ""
+    UPSTOX_API_SECRET: str = ""
+    UPSTOX_REDIRECT_URI: str = ""
+
+    # Live feed pacing. Upstox allows 2000 calls / 30 min, so quotes every 2s + chain every 30s stays well inside.
+    LIVE_QUOTE_INTERVAL_SEC: float = 2.0
+    LIVE_CHAIN_INTERVAL_SEC: float = 30.0
+    LIVE_CANDLE_SECONDS: int = 60
+    OPTION_CHAIN_STRIKES_EACH_SIDE: int = 6
+
     # System settings
     MARKET_OPEN_HOUR: int = 9
     MARKET_OPEN_MINUTE: int = 15
@@ -58,6 +69,10 @@ class Settings(BaseSettings):
     @property
     def cors_origins_list(self) -> List[str]:
         return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
+
+    @property
+    def upstox_configured(self) -> bool:
+        return bool(self.UPSTOX_API_KEY and self.UPSTOX_API_SECRET and self.UPSTOX_REDIRECT_URI)
 
     @property
     def is_production(self) -> bool:

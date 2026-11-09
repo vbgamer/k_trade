@@ -6,7 +6,7 @@ import redis.asyncio as aioredis
 from typing import Dict, Any, List, Optional
 from app.engine.registry import BaseStrategy, StrategyRegistry
 from app.core.config import settings
-from app.core.memory_bus import in_memory_candles
+from app.core.memory_bus import in_memory_candles, market_snapshot
 
 logger = logging.getLogger("strategy_kaushal")
 
@@ -91,7 +91,15 @@ class KaushalCustomWMASMACall1(BaseStrategy):
         open_positions: List[Dict[str, Any]]
     ) -> Optional[Dict[str, Any]]:
         instrument_key = candle_data["instrument_key"]
-        
+
+        # Only the ATM call drives entries; once in a trade, only the held contract drives exits.
+        # (Candles arrive for every quoted instrument, including the index, which is not tradable.)
+        if open_positions:
+            if instrument_key != open_positions[0]["instrument_key"]:
+                return None
+        elif instrument_key != market_snapshot.get("atm_ce_key"):
+            return None
+
         # 1. Load historical closed candles (try Redis, fallback to Memory Bus)
         candles = []
         use_fallback = False
@@ -145,9 +153,9 @@ class KaushalCustomWMASMACall1(BaseStrategy):
         
         in_trade = len(open_positions) > 0
         
-        # Check market time cut-offs (auto-flatten at 15:30 IST)
+        # Check market time cut-offs (auto-flatten from 15:15 IST, before brokers' MIS square-off)
         ist_now = datetime.datetime.now(self.ist)
-        if ist_now.hour >= 15 and ist_now.minute >= 30:
+        if (ist_now.hour, ist_now.minute) >= (15, 15):
             if in_trade:
                 logger.info("Cutoff limit reached. Exiting positions.")
                 return {

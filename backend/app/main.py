@@ -3,9 +3,12 @@ import json
 import logging
 import datetime
 import asyncio
+import secrets
+import time
 from typing import Dict, Optional, Set
 from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,13 +24,16 @@ from app.db.models import (
 )
 from app.schemas import (
     RegisterRequest, LoginRequest, BrokerCredentialsRequest, BrokerVerifyRequest,
-    SubscriptionRequest, ToggleRequest, DemoTradeRequest
+    SubscriptionRequest, ToggleRequest, DemoTradeRequest, OrderRequest
 )
 from app.services.bootstrap import ensure_default_strategies
 from app.services.demo_seed import seed_user_past_trades
 from app.services.scheduler import StrategyScheduler
 from app.workers.tasks import start_strategy_task
-from app.core.memory_bus import memory_bus
+from app.core.memory_bus import memory_bus, market_snapshot, in_memory_quotes
+from app.broker.upstox import UpstoxClient, UpstoxError, authorization_url
+from app.services import upstox_session
+from app.services.audit import log_audit
 # Import strategy to trigger registration
 from app.strategies.kaushalcustomWMASMACall1.strategy import KaushalCustomWMASMACall1
 
@@ -148,7 +154,14 @@ async def redis_event_bus_listener():
 # Memory Bus ws callback for local execution fallback
 async def memory_bus_ws_callback(channel: str, message: str):
     try:
-        await manager.broadcast(_tick_event(json.loads(message)))
+        if channel == "market:quotes":
+            await manager.broadcast(json.dumps({
+                "event_type": "QuoteUpdate",
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                "data": json.loads(message)
+            }))
+        elif channel.startswith("market:candles:"):
+            await manager.broadcast(_tick_event(json.loads(message)))
     except Exception:
         pass
 
@@ -187,9 +200,13 @@ async def startup_event():
     # Subscribe websocket gateway to Memory Bus fallback
     memory_bus.subscribe(memory_bus_ws_callback)
 
-    # Start Market Data Feed Simulator locally inside the API process
+    # Restore today's Upstox session (if any) so the feed starts live after a restart
+    async with async_session_maker() as db:
+        await upstox_session.load(db)
+
+    # Start Market Data Feed locally inside the API process (Upstox when connected, simulator otherwise)
     from app.engine.market_data import MarketDataService
-    mds = MarketDataService(candle_duration_sec=5) # 5-second candles for fast visual testing
+    mds = MarketDataService(candle_duration_sec=5) # simulator: 5-second candles for fast visual testing
     await mds.connect()
     await mds.start_stream()
 
@@ -679,6 +696,117 @@ async def get_positions(user_id: str = Depends(get_current_user_id), db: AsyncSe
         }
         for pos in positions
     ]
+
+# --- UPSTOX MARKET DATA CONNECTION ---
+
+# One-time OAuth states: state -> (user_id, expires_at epoch)
+_upstox_oauth_states: Dict[str, tuple] = {}
+
+@app.get("/api/v1/broker/upstox/status")
+async def upstox_status(user_id: str = Depends(get_current_user_id)):
+    return {
+        "configured": settings.upstox_configured,
+        "data_source": market_snapshot.get("source", "simulator"),
+        **upstox_session.status(),
+    }
+
+@app.get("/api/v1/broker/upstox/login")
+async def upstox_login(user_id: str = Depends(get_current_user_id)):
+    if not settings.upstox_configured:
+        raise HTTPException(status_code=503, detail="Upstox API key/secret are not configured on the server.")
+    now = time.time()
+    for s, (_, exp) in list(_upstox_oauth_states.items()):
+        if exp < now:
+            _upstox_oauth_states.pop(s, None)
+    state = secrets.token_urlsafe(24)
+    _upstox_oauth_states[state] = (user_id, now + 600)
+    return {"url": authorization_url(settings.UPSTOX_API_KEY, settings.UPSTOX_REDIRECT_URI, state)}
+
+@app.get("/api/v1/broker/upstox/callback", include_in_schema=False)
+async def upstox_callback(code: str = "", state: str = "", db: AsyncSession = Depends(get_db)):
+    """Upstox redirects the browser here after login; no Authorization header, so `state` authenticates it."""
+    entry = _upstox_oauth_states.pop(state, None)
+    if not entry or entry[1] < time.time():
+        return RedirectResponse("/?broker=upstox_error&reason=expired_login_link", status_code=303)
+    if not code:
+        return RedirectResponse("/?broker=upstox_error&reason=login_cancelled", status_code=303)
+    try:
+        body = await UpstoxClient().exchange_code(
+            code, settings.UPSTOX_API_KEY, settings.UPSTOX_API_SECRET, settings.UPSTOX_REDIRECT_URI
+        )
+    except UpstoxError as e:
+        logger.warning(f"Upstox token exchange failed: {e}")
+        return RedirectResponse("/?broker=upstox_error&reason=token_exchange_failed", status_code=303)
+
+    await upstox_session.save(db, body["access_token"], body.get("user_name"))
+    await log_audit(db=db, user_id=entry[0], event_type="UPSTOX_CONNECTED",
+                    message=f"Upstox market data connected ({body.get('user_name') or 'unknown user'})")
+    return RedirectResponse("/?broker=upstox_connected", status_code=303)
+
+@app.post("/api/v1/broker/upstox/disconnect")
+async def upstox_disconnect(user_id: str = Depends(get_current_user_id), db: AsyncSession = Depends(get_db)):
+    await upstox_session.clear(db)
+    return {"connected": False}
+
+@app.get("/api/v1/market/snapshot")
+async def get_market_snapshot(user_id: str = Depends(get_current_user_id)):
+    """Option chain window around ATM with live prices; refreshed by the market data loop."""
+    return market_snapshot
+
+# --- MANUAL ORDERS (Trade screen) ---
+
+MANUAL_SUBSCRIPTION_QTY = 1800  # RMS caps a single order at 2x this
+
+async def _manual_subscription(db: AsyncSession, user_id: str) -> StrategySubscription:
+    res = await db.execute(select(StrategySubscription).where(StrategySubscription.user_id == user_id))
+    for sub in res.scalars().all():
+        if (sub.config_json or {}).get("manual"):
+            return sub
+    version = (await db.execute(select(StrategyVersion))).scalars().first()
+    if not version:
+        raise HTTPException(status_code=503, detail="No strategy versions are registered yet.")
+    sub = StrategySubscription(
+        user_id=user_id, strategy_version_id=version.id, status="manual",
+        quantity=MANUAL_SUBSCRIPTION_QTY, config_json={"manual": True}
+    )
+    db.add(sub)
+    await db.commit()
+    await db.refresh(sub)
+    return sub
+
+@app.post("/api/v1/orders")
+async def place_manual_order(payload: OrderRequest, user_id: str = Depends(get_current_user_id), db: AsyncSession = Depends(get_db)):
+    if payload.instrument_key.startswith("NSE_INDEX|"):
+        raise HTTPException(status_code=400, detail="An index cannot be traded directly. Pick an option contract.")
+    if payload.order_type == "LIMIT" and payload.limit_price is None:
+        raise HTTPException(status_code=422, detail="limit_price is required for LIMIT orders")
+
+    sub = await _manual_subscription(db, user_id)
+    from app.services.execution import ExecutionService
+    client_order_id = f"mo_{user_id[:8]}_{int(time.time() * 1000)}_{payload.side.lower()}"
+    quote = in_memory_quotes.get(payload.instrument_key) or {}
+    result = await ExecutionService(db).execute_trade(
+        subscription_id=sub.id,
+        side=payload.side,
+        instrument_key=payload.instrument_key,
+        quantity=payload.quantity,
+        client_order_id=client_order_id,
+        order_type=payload.order_type,
+        limit_price=payload.limit_price,
+        product_type=payload.product_type,
+        trading_symbol=payload.trading_symbol,
+        entry_price=payload.limit_price or quote.get("ltp"),
+        stop_loss=payload.stop_loss,
+        target=payload.target,
+    )
+    if result.get("status") == "FILLED":
+        await manager.send_to_user(user_id, _user_event("OrderFilled", {
+            "trading_symbol": payload.trading_symbol or payload.instrument_key,
+            "side": payload.side,
+            "quantity": payload.quantity,
+            "fill_price": result.get("fill_price"),
+        }))
+    return result
 
 # --- WEBSOCKET ROUTING ---
 @app.websocket("/api/v1/ws/stream")

@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import BrokerOrder, Trade, StrategySubscription, User, Position
 from app.broker.mock_live_adapter import MockLiveAdapter
 from app.engine.rms import RMSService
+from app.core.memory_bus import tracked_keys
 from app.services.audit import log_audit
 from app.services.portfolio import update_position
 
@@ -107,7 +108,7 @@ class ExecutionService:
             return {"ok": False, "status": "REJECTED", "rejection_reason": reason}
 
         # Determine trading segment
-        is_fno = "OPTION" in instrument_key or "NIFTY" in instrument_key or "BANKNIFTY" in instrument_key or "FUT" in instrument_key
+        is_fno = instrument_key.startswith("NSE_FO|") or "OPTION" in instrument_key or "NIFTY" in instrument_key or "BANKNIFTY" in instrument_key or "FUT" in instrument_key
         segment = "FNO" if is_fno else ("INTRADAY" if product_type == "MIS" else "EQUITY")
 
         # 3. Create Pending BrokerOrder in database
@@ -159,6 +160,8 @@ class ExecutionService:
                 
                 order.broker_order_id = broker_order_id
                 order.status = "FILLED"
+                if instrument_key.startswith("NSE_FO|"):
+                    tracked_keys.add(instrument_key)  # keep live-quoting it for MTM until flat
                 
                 # Trigger Portfolio Service positions adjustments & compute realized P&L
                 pos, trade_realized = await update_position(

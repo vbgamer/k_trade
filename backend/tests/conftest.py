@@ -12,6 +12,8 @@ os.environ["ENCRYPTION_KEY"] = Fernet.generate_key().decode()
 os.environ["REDIS_URL"] = "redis://127.0.0.1:1/0"  # unreachable on purpose: exercises the memory-bus fallback
 os.environ["RABBITMQ_URL"] = "amqp://guest:guest@127.0.0.1:1//"
 os.environ["DEMO_MODE"] = "false"
+os.environ["UPSTOX_API_KEY"] = ""  # never use the developer's real Upstox app in tests
+os.environ["UPSTOX_API_SECRET"] = ""
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 

@@ -135,7 +135,7 @@ def test_websocket_rejects_missing_or_bad_token(client):
 def _next_non_tick(ws, limit=200):
     for _ in range(limit):
         msg = ws.receive_json()
-        if msg["event_type"] != "TickUpdate":
+        if msg["event_type"] not in ("TickUpdate", "QuoteUpdate"):
             return msg
     return None
 

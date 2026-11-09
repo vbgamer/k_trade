@@ -3,6 +3,7 @@ import asyncio
 import time
 from typing import Dict, Any, List, Optional
 from app.broker.base_adapter import BaseBrokerAdapter
+from app.core.memory_bus import in_memory_quotes
 
 # In-memory shared state for simulation purposes
 class GlobalMarketState:
@@ -18,6 +19,44 @@ class GlobalMarketState:
         return self.nifty_spot
 
 market_state = GlobalMarketState()
+
+LIVE_QUOTE_MAX_AGE_SEC = 15.0
+PAPER_BROKERAGE_PER_ORDER = 20.0  # INR, typical discount-broker F&O fee
+
+
+def is_live_instrument(instrument_key: str) -> bool:
+    """Upstox instrument keys (NSE_FO|<token>) are priced from the live feed, never the random model."""
+    return instrument_key.startswith("NSE_FO|")
+
+
+def paper_fill_from_quote(
+    broker_order_id: str, side: str, instrument_key: str, order_type: str, limit_price: Optional[float]
+) -> Dict[str, Any]:
+    quote = in_memory_quotes.get(instrument_key)
+    if not quote or not quote.get("live") or time.time() - quote["ts"] > LIVE_QUOTE_MAX_AGE_SEC:
+        return {"status": "REJECTED", "rejection_reason": "No fresh live price for this contract. Is Upstox connected?"}
+
+    ltp = quote["ltp"]
+    # Fall back to LTP when the book side is empty (e.g. pre-open or illiquid strike)
+    best = (quote.get("ask") if side == "BUY" else quote.get("bid")) or ltp
+    if order_type == "LIMIT":
+        if limit_price is None:
+            return {"status": "REJECTED", "rejection_reason": "Limit price required"}
+        marketable = limit_price >= best if side == "BUY" else limit_price <= best
+        if not marketable:
+            return {
+                "status": "REJECTED",
+                "rejection_reason": f"Limit {limit_price} not marketable (best {'ask' if side == 'BUY' else 'bid'} {best}). "
+                                    "Paper engine fills only immediately executable limit orders.",
+            }
+
+    return {
+        "status": "FILLED",
+        "broker_order_id": broker_order_id,
+        "fill_price": round(best, 2),
+        "slippage": round(best - ltp, 2),
+        "brokerage_fees": PAPER_BROKERAGE_PER_ORDER,
+    }
 
 class MockLiveAdapter(BaseBrokerAdapter):
     """
@@ -50,6 +89,9 @@ class MockLiveAdapter(BaseBrokerAdapter):
 
     async def get_ltp(self, instrument_key: str) -> float:
         await asyncio.sleep(0.02)
+        quote = in_memory_quotes.get(instrument_key)
+        if quote and quote.get("live"):
+            return quote["ltp"]
         spot = market_state.nifty_spot
         
         # Format: e.g. "NSE_INDEX|Nifty 50" or "NSE_OPTION|NIFTY26JUL24300CE"
@@ -105,16 +147,22 @@ class MockLiveAdapter(BaseBrokerAdapter):
         product_type: str = "MIS"
     ) -> Dict[str, Any]:
         await asyncio.sleep(0.05)  # Execution network latency
-        
+
+        broker_order_id = f"bo_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+
+        # Live-data paper fills: cross the real spread (buy at ask, sell at bid)
+        if is_live_instrument(instrument_key):
+            return paper_fill_from_quote(broker_order_id, side, instrument_key, order_type, limit_price)
+
         # Enforce rate limits check simulation
         if random.random() < 0.005:  # 0.5% chance of connection drop
             return {
                 "status": "REJECTED",
                 "rejection_reason": "INSUFFICIENT_FUNDS_OR_LIMIT_REJECTION"
             }
-            
+
         ltp = await self.get_ltp(instrument_key)
-        
+
         # Simulate slippage on market orders
         slippage = 0.0
         if order_type == "MARKET":
@@ -125,8 +173,6 @@ class MockLiveAdapter(BaseBrokerAdapter):
         else:
             fill_price = limit_price or ltp
 
-        broker_order_id = f"bo_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
-        
         return {
             "status": "FILLED",
             "broker_order_id": broker_order_id,

@@ -59,3 +59,16 @@ class DemoTradeRequest(_Strict):
     quantity: int = Field(default=50, gt=0, le=10000)
     segment: Literal["FNO", "INTRADAY"] = "FNO"
     symbol: str = Field(default="NIFTY26JUL24300CE", pattern=r"^[A-Z0-9\-]{1,40}$")
+
+
+class OrderRequest(_Strict):
+    """Manual order from the Trade screen. instrument_key must be a contract with a known price."""
+    instrument_key: str = Field(min_length=3, max_length=100, pattern=r"^[A-Za-z_]+\|[A-Za-z0-9 \-]+$")
+    trading_symbol: Optional[str] = Field(default=None, max_length=100)
+    side: Side
+    quantity: int = Field(gt=0, le=10000)
+    order_type: Literal["MARKET", "LIMIT"] = "MARKET"
+    limit_price: Optional[float] = Field(default=None, gt=0)
+    product_type: ProductType = "MIS"
+    stop_loss: Optional[float] = Field(default=None, gt=0)
+    target: Optional[float] = Field(default=None, gt=0)

@@ -42,7 +42,8 @@ async def run_strategy_loop(subscription_id: str):
     memory_queue = asyncio.Queue()
     
     async def memory_bus_callback(channel: str, message: str):
-        await memory_queue.put(message)
+        if channel.startswith("market:candles:"):  # ignore quote snapshots and other channels
+            await memory_queue.put(message)
         
     if not use_redis:
         from app.core.memory_bus import memory_bus

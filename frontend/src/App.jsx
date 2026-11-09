@@ -27,8 +27,8 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState("");
   const [successMsg, setSuccessMsg] = useState("");
 
-  // Navigation tab: dashboard | trades | broker
-  const [activeTab, setActiveTab] = useState("dashboard");
+  // Navigation tab: trade | dashboard | trades | broker
+  const [activeTab, setActiveTab] = useState("trade");
 
   // Segment Selection (Active: Intraday & F&O; Upcoming: Delivery, Commodity, Currency, Crypto)
   const [selectedSegment, setSelectedSegment] = useState("fno"); // "fno" | "intraday"
@@ -72,8 +72,23 @@ export default function App() {
   });
   const [verifyingBroker, setVerifyingBroker] = useState(false);
 
+  // Live market (Upstox or simulator) & Trade screen
+  const [marketSnap, setMarketSnap] = useState({ source: "simulator", rows: [] });
+  const [quotes, setQuotes] = useState({});
+  const [upstox, setUpstox] = useState({ configured: false, connected: false });
+  const [ticket, setTicket] = useState(null); // { instrument_key, trading_symbol, side }
+  const [ticketLots, setTicketLots] = useState(1);
+  const [ticketType, setTicketType] = useState("MARKET");
+  const [ticketPrice, setTicketPrice] = useState("");
+  const [ticketSl, setTicketSl] = useState("");
+  const [ticketTarget, setTicketTarget] = useState("");
+  const [ticketProduct, setTicketProduct] = useState("MIS");
+  const [placingOrder, setPlacingOrder] = useState(false);
+  const [toast, setToast] = useState(null); // { ok, text }
+
   // WebSocket & Terminal
   const ws = useRef(null);
+  const sourceRef = useRef("simulator");
   const terminalEndRef = useRef(null);
 
   // Load session data
@@ -86,6 +101,8 @@ export default function App() {
       fetchPositions();
       fetchPortfolioSummary();
       fetchTrades();
+      fetchUpstoxStatus();
+      fetchSnapshot();
       connectWebSocket();
     } else {
       localStorage.removeItem("token");
@@ -101,6 +118,29 @@ export default function App() {
       fetchTrades();
     }
   }, [tradeFilterSegment, tradeFilterSide, activeTab]);
+
+  // Option chain structure (strikes/contracts) refreshes every 30s; prices stream in via QuoteUpdate
+  useEffect(() => {
+    if (!token) return;
+    const id = setInterval(() => {
+      fetchSnapshot();
+      fetchUpstoxStatus();
+    }, 30000);
+    return () => clearInterval(id);
+  }, [token]);
+
+  // Result of the Upstox login redirect (/?broker=upstox_connected | upstox_error&reason=...)
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const result = params.get("broker");
+    if (!result) return;
+    if (result === "upstox_connected") {
+      showToast(true, "Upstox connected. Live NSE prices are on.");
+    } else {
+      showToast(false, `Upstox login failed: ${(params.get("reason") || "unknown").replace(/_/g, " ")}`);
+    }
+    window.history.replaceState({}, "", window.location.pathname);
+  }, []);
 
   // Autoscroll terminal
   useEffect(() => {
@@ -135,7 +175,20 @@ export default function App() {
         const payload = JSON.parse(event.data);
         const { event_type, data } = payload;
 
-        if (event_type === "TickUpdate") {
+        if (event_type === "QuoteUpdate") {
+          setQuotes((prev) => ({ ...prev, ...data.quotes }));
+          if (sourceRef.current !== data.source) {
+            // Source switched (simulator <-> Upstox): reload the chain for the new instrument keys
+            sourceRef.current = data.source;
+            fetchSnapshot();
+            fetchUpstoxStatus();
+          }
+          setMarketSnap((prev) =>
+            prev.source !== data.source
+              ? { ...prev, source: data.source, spot: data.spot, rows: [] }
+              : { ...prev, spot: data.spot ?? prev.spot }
+          );
+        } else if (event_type === "TickUpdate") {
           const ltp = data.ltp;
           setCurrentLtp(ltp);
           setCurrentStrike(data.instrument_key.split("|")[-1] || data.instrument_key);
@@ -270,6 +323,128 @@ export default function App() {
     } finally {
       setTradesLoading(false);
     }
+  };
+
+  const fetchUpstoxStatus = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/broker/upstox/status`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) setUpstox(await res.json());
+    } catch (err) {
+      console.error("Error loading Upstox status:", err);
+    }
+  };
+
+  const fetchSnapshot = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/market/snapshot`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        sourceRef.current = data.source;
+        setMarketSnap(data);
+      }
+    } catch (err) {
+      console.error("Error loading market snapshot:", err);
+    }
+  };
+
+  // --- TRADE SCREEN ---
+  const showToast = (ok, text) => {
+    setToast({ ok, text });
+    setTimeout(() => setToast(null), 4000);
+  };
+
+  // Latest price for a contract: streamed quote first, then the chain snapshot
+  const liveQuote = (key, fallback = {}) => ({ ...fallback, ...(quotes[key] || {}) });
+
+  const fmt = (n, digits = 2) =>
+    n == null || Number.isNaN(Number(n)) ? "–" : Number(n).toLocaleString("en-IN", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+
+  const lotSize = marketSnap.lot_size || 1;
+
+  const openTicket = (leg, side) => {
+    setTicket({ instrument_key: leg.instrument_key, trading_symbol: leg.trading_symbol, side, base: leg });
+    setTicketLots(1);
+    setTicketType("MARKET");
+    setTicketPrice("");
+    setTicketSl("");
+    setTicketTarget("");
+  };
+
+  const handleUpstoxConnect = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/broker/upstox/login`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(errorDetail(data, "Could not start Upstox login"));
+      window.location.href = data.url; // Upstox login page; it redirects back to /?broker=...
+    } catch (err) {
+      showToast(false, err.message);
+    }
+  };
+
+  const handleUpstoxDisconnect = async () => {
+    if (!window.confirm("Disconnect Upstox? Prices will switch back to the simulator.")) return;
+    await fetch(`${API_BASE}/api/v1/broker/upstox/disconnect`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    fetchUpstoxStatus();
+  };
+
+  const submitOrder = async (order) => {
+    setPlacingOrder(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/orders`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify(order)
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(errorDetail(data, "Order failed"));
+      if (data.status !== "FILLED") throw new Error(data.rejection_reason || `Order ${data.status}`);
+      showToast(true, `${order.side} ${order.quantity} ${order.trading_symbol || ""} filled @ ₹${fmt(data.fill_price)}`);
+      setTicket(null);
+      fetchPositions();
+      fetchPortfolioSummary();
+      fetchTrades();
+      fetchUserProfile();
+    } catch (err) {
+      showToast(false, err.message);
+    } finally {
+      setPlacingOrder(false);
+    }
+  };
+
+  const handlePlaceTicket = () => {
+    if (!ticket) return;
+    submitOrder({
+      instrument_key: ticket.instrument_key,
+      trading_symbol: ticket.trading_symbol,
+      side: ticket.side,
+      quantity: ticketLots * lotSize,
+      order_type: ticketType,
+      limit_price: ticketType === "LIMIT" ? Number(ticketPrice) : null,
+      product_type: ticketProduct,
+      stop_loss: ticketSl ? Number(ticketSl) : null,
+      target: ticketTarget ? Number(ticketTarget) : null
+    });
+  };
+
+  const handleExitPosition = (pos) => {
+    if (!window.confirm(`Exit ${pos.trading_symbol} at market?`)) return;
+    submitOrder({
+      instrument_key: pos.instrument_key,
+      trading_symbol: pos.trading_symbol,
+      side: pos.quantity > 0 ? "SELL" : "BUY",
+      quantity: Math.abs(pos.quantity),
+      order_type: "MARKET",
+      product_type: "MIS"
+    });
   };
 
   // --- ACTIONS & HANDLERS ---
@@ -623,8 +798,11 @@ export default function App() {
         <div style={{ display: "flex", alignItems: "center", gap: "12px", background: "rgba(0,0,0,0.35)", padding: "6px 14px", borderRadius: "10px", border: "1px solid var(--border-glow)" }}>
           <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: "var(--color-green)", boxShadow: "var(--shadow-neon-green)" }} className="pulse-glow"></span>
           <div>
-            <div style={{ fontSize: "0.75rem", color: "var(--color-cyan)", fontWeight: "600" }}>
-              {brokerStatus.broker_name || "Paper Trading Active"}
+            <div style={{ fontSize: "0.75rem", color: "var(--color-cyan)", fontWeight: "600", display: "flex", alignItems: "center", gap: "6px" }}>
+              Paper Trading
+              <span className={marketSnap.source === "upstox" ? "badge-active" : "badge-upcoming"} style={{ fontSize: "0.62rem", padding: "1px 6px" }}>
+                {marketSnap.source === "upstox" ? "LIVE NSE" : "SIMULATED"}
+              </span>
             </div>
             <div style={{ fontSize: "0.82rem", color: "#fff", fontWeight: "700" }}>
               Margin: ₹{virtualMargin.toLocaleString("en-IN", { minimumFractionDigits: 2 })}
@@ -641,6 +819,22 @@ export default function App() {
 
         {/* Center Tabs Navigation */}
         <nav className="app-nav" style={{ display: "flex", gap: "10px" }}>
+          <button
+            onClick={() => setActiveTab("trade")}
+            style={{
+              padding: "8px 16px",
+              borderRadius: "8px",
+              border: activeTab === "trade" ? "1px solid var(--color-cyan)" : "1px solid transparent",
+              background: activeTab === "trade" ? "rgba(6, 182, 212, 0.15)" : "transparent",
+              color: activeTab === "trade" ? "var(--color-cyan)" : "var(--color-text-muted)",
+              fontSize: "0.92rem",
+              fontWeight: "600",
+              cursor: "pointer",
+              transition: "all 0.2s"
+            }}
+          >
+            ⚡ Trade
+          </button>
           <button
             onClick={() => setActiveTab("dashboard")}
             style={{
@@ -800,7 +994,115 @@ export default function App() {
 
       {/* Main Containers */}
       <main className="app-main" style={{ flex: 1, padding: "0 18px 20px 18px" }}>
-        
+
+        {/* ============================================================ */}
+        {/* TAB 0: TRADE (live option chain, order ticket, positions)    */}
+        {/* ============================================================ */}
+        {activeTab === "trade" && (() => {
+          const spot = marketSnap.spot;
+          const prevClose = marketSnap.spot_prev_close;
+          const change = spot != null && prevClose ? spot - prevClose : null;
+          const openPositions = positions.filter((p) => p.quantity !== 0);
+          const totalPnl = openPositions.reduce((sum, p) => {
+            const ltp = liveQuote(p.instrument_key).ltp;
+            return ltp == null ? sum : sum + p.quantity * (ltp - p.average_price);
+          }, 0);
+          return (
+            <div className="trade-layout">
+              {/* Market header */}
+              <div className="glass-panel" style={{ padding: "16px 18px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "10px" }}>
+                <div>
+                  <div style={{ fontSize: "0.75rem", color: "var(--color-text-muted)", letterSpacing: "1px" }}>NIFTY 50</div>
+                  <div style={{ display: "flex", alignItems: "baseline", gap: "10px" }}>
+                    <span style={{ fontSize: "1.6rem", fontWeight: "800", fontFamily: "var(--font-mono)" }}>{fmt(spot)}</span>
+                    {change != null && (
+                      <span style={{ color: change >= 0 ? "var(--color-green)" : "var(--color-red)", fontWeight: "600", fontSize: "0.9rem" }}>
+                        {change >= 0 ? "+" : ""}{fmt(change)} ({fmt((change / prevClose) * 100)}%)
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div style={{ textAlign: "right", fontSize: "0.78rem", color: "var(--color-text-muted)" }}>
+                  <span className={marketSnap.source === "upstox" ? "badge-active" : "badge-upcoming"}>
+                    {marketSnap.source === "upstox" ? "● LIVE NSE" : "SIMULATED"}
+                  </span>
+                  <div style={{ marginTop: "6px" }}>
+                    {marketSnap.expiry ? `Expiry ${marketSnap.expiry}` : "Demo prices"} · Lot {lotSize}
+                  </div>
+                  {marketSnap.source !== "upstox" && upstox.configured && (
+                    <button className="link-btn" onClick={handleUpstoxConnect}>Connect Upstox for live prices →</button>
+                  )}
+                </div>
+              </div>
+
+              {/* Open positions */}
+              <div className="glass-panel" style={{ padding: "14px 16px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+                  <span style={{ fontWeight: "700" }}>Positions ({openPositions.length})</span>
+                  <span style={{ fontFamily: "var(--font-mono)", fontWeight: "700", color: totalPnl >= 0 ? "var(--color-green)" : "var(--color-red)" }}>
+                    {totalPnl >= 0 ? "+" : ""}₹{fmt(totalPnl)}
+                  </span>
+                </div>
+                {openPositions.length === 0 && (
+                  <div style={{ color: "var(--color-text-muted)", fontSize: "0.85rem" }}>No open positions. Tap a price in the option chain to trade.</div>
+                )}
+                {openPositions.map((p) => {
+                  const ltp = liveQuote(p.instrument_key).ltp;
+                  const pnl = ltp == null ? null : p.quantity * (ltp - p.average_price);
+                  return (
+                    <div key={p.instrument_key} className="position-row">
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontWeight: "600", fontSize: "0.88rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.trading_symbol}</div>
+                        <div style={{ fontSize: "0.75rem", color: "var(--color-text-muted)" }}>
+                          {p.quantity > 0 ? "LONG" : "SHORT"} {Math.abs(p.quantity)} · Avg {fmt(p.average_price)} · LTP {fmt(ltp)}
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                        <span style={{ fontFamily: "var(--font-mono)", fontWeight: "700", color: (pnl || 0) >= 0 ? "var(--color-green)" : "var(--color-red)" }}>
+                          {pnl == null ? "–" : `${pnl >= 0 ? "+" : ""}${fmt(pnl)}`}
+                        </span>
+                        <button className="exit-btn" disabled={placingOrder} onClick={() => handleExitPosition(p)}>Exit</button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Option chain */}
+              <div className="glass-panel" style={{ padding: "0", overflow: "hidden" }}>
+                <div className="chain-row chain-head">
+                  <span>CALL LTP</span>
+                  <span style={{ textAlign: "center" }}>STRIKE</span>
+                  <span style={{ textAlign: "right" }}>PUT LTP</span>
+                </div>
+                {(marketSnap.rows || []).length === 0 && (
+                  <div style={{ padding: "18px", color: "var(--color-text-muted)", fontSize: "0.85rem" }}>Loading option chain…</div>
+                )}
+                {(marketSnap.rows || []).map((row) => {
+                  const isAtm = row.strike === marketSnap.atm_strike;
+                  const ce = row.ce && liveQuote(row.ce.instrument_key, row.ce);
+                  const pe = row.pe && liveQuote(row.pe.instrument_key, row.pe);
+                  const itmCe = spot != null && row.strike < spot;
+                  const itmPe = spot != null && row.strike > spot;
+                  return (
+                    <div key={row.strike} className={`chain-row ${isAtm ? "chain-atm" : ""}`}>
+                      <button className={`price-btn ${itmCe ? "itm" : ""}`} disabled={!ce} onClick={() => ce && openTicket(ce, "BUY")}>
+                        <span className="price">{fmt(ce?.ltp)}</span>
+                        {ce?.delta != null && <span className="sub">Δ {fmt(ce.delta)}</span>}
+                      </button>
+                      <span className="strike">{row.strike}{isAtm && <small>ATM</small>}</span>
+                      <button className={`price-btn right ${itmPe ? "itm" : ""}`} disabled={!pe} onClick={() => pe && openTicket(pe, "BUY")}>
+                        <span className="price">{fmt(pe?.ltp)}</span>
+                        {pe?.delta != null && <span className="sub">Δ {fmt(pe.delta)}</span>}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })()}
+
         {/* ============================================================ */}
         {/* TAB 1: LIVE DASHBOARD & STRATEGY ENGINE                      */}
         {/* ============================================================ */}
@@ -1231,6 +1533,42 @@ export default function App() {
         {/* ============================================================ */}
         {activeTab === "broker" && (
           <div style={{ maxWidth: "540px", margin: "20px auto" }}>
+            {/* Upstox live market data */}
+            <div className="glass-panel" style={{ padding: "22px", marginBottom: "18px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px" }}>
+                <div>
+                  <h3 style={{ color: "var(--color-cyan)", fontSize: "1.1rem", margin: 0 }}>Upstox · Live NSE Prices</h3>
+                  <p style={{ fontSize: "0.82rem", color: "var(--color-text-muted)", marginTop: "4px" }}>
+                    Paper orders fill at real bid/ask from Upstox. Log in once each trading day.
+                  </p>
+                </div>
+                <span className={upstox.connected ? "badge-active" : "badge-upcoming"}>
+                  {upstox.connected ? "CONNECTED" : "OFFLINE"}
+                </span>
+              </div>
+              {upstox.connected && (
+                <div style={{ fontSize: "0.8rem", color: "var(--color-text-muted)", marginTop: "10px" }}>
+                  {upstox.user_name && <>Account: <strong style={{ color: "#fff" }}>{upstox.user_name}</strong> · </>}
+                  Valid until {new Date(upstox.expires_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}
+                </div>
+              )}
+              {upstox.last_error && !upstox.connected && (
+                <div style={{ fontSize: "0.8rem", color: "var(--color-red)", marginTop: "10px" }}>{upstox.last_error}</div>
+              )}
+              {!upstox.configured ? (
+                <div style={{ fontSize: "0.8rem", color: "var(--color-red)", marginTop: "12px" }}>
+                  Upstox API key/secret are not set on the server.
+                </div>
+              ) : (
+                <button
+                  onClick={upstox.connected ? handleUpstoxDisconnect : handleUpstoxConnect}
+                  style={{ width: "100%", marginTop: "14px", padding: "12px", borderRadius: "8px", border: upstox.connected ? "1px solid var(--border-glow)" : "none", cursor: "pointer", background: upstox.connected ? "transparent" : "var(--color-cyan)", color: "#fff", fontWeight: "700" }}
+                >
+                  {upstox.connected ? "Disconnect" : "Connect Upstox"}
+                </button>
+              )}
+            </div>
+
             <div className="glass-panel" style={{ padding: "30px" }}>
               <div style={{ marginBottom: "22px" }}>
                 <h3 style={{ color: "var(--color-secondary)", fontSize: "1.2rem", margin: 0 }}>
@@ -1330,6 +1668,88 @@ export default function App() {
         )}
 
       </main>
+
+      {/* Order ticket (bottom sheet on phones) */}
+      {ticket && (() => {
+        const q = liveQuote(ticket.instrument_key, ticket.base);
+        const isBuy = ticket.side === "BUY";
+        const qty = ticketLots * lotSize;
+        const estPrice = ticketType === "LIMIT" && ticketPrice ? Number(ticketPrice) : (isBuy ? q.ask || q.ltp : q.bid || q.ltp);
+        const accent = isBuy ? "var(--color-green)" : "var(--color-red)";
+        return (
+          <div className="sheet-backdrop" onClick={() => !placingOrder && setTicket(null)}>
+            <div className="glass-panel sheet" onClick={(e) => e.stopPropagation()}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "10px" }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontWeight: "700", fontSize: "1rem" }}>{ticket.trading_symbol}</div>
+                  <div style={{ fontSize: "0.8rem", color: "var(--color-text-muted)", fontFamily: "var(--font-mono)" }}>
+                    LTP {fmt(q.ltp)} · Bid {fmt(q.bid)} · Ask {fmt(q.ask)}
+                  </div>
+                </div>
+                <button className="link-btn" onClick={() => setTicket(null)} aria-label="Close">✕</button>
+              </div>
+
+              <div className="seg-toggle">
+                {["BUY", "SELL"].map((s) => (
+                  <button key={s} className={ticket.side === s ? `on ${s.toLowerCase()}` : ""} onClick={() => setTicket({ ...ticket, side: s })}>{s}</button>
+                ))}
+              </div>
+
+              <div className="ticket-grid">
+                <label>Lots
+                  <div className="stepper">
+                    <button onClick={() => setTicketLots(Math.max(1, ticketLots - 1))}>−</button>
+                    <input type="number" min="1" value={ticketLots} onChange={(e) => setTicketLots(Math.max(1, parseInt(e.target.value || "1", 10)))} />
+                    <button onClick={() => setTicketLots(ticketLots + 1)}>+</button>
+                  </div>
+                  <small>Qty {qty}</small>
+                </label>
+                <label>Product
+                  <select value={ticketProduct} onChange={(e) => setTicketProduct(e.target.value)}>
+                    <option value="MIS">MIS (Intraday)</option>
+                    <option value="NRML">NRML (Overnight)</option>
+                  </select>
+                </label>
+                <label>Order type
+                  <select value={ticketType} onChange={(e) => setTicketType(e.target.value)}>
+                    <option value="MARKET">Market</option>
+                    <option value="LIMIT">Limit</option>
+                  </select>
+                </label>
+                <label>Limit price
+                  <input type="number" step="0.05" disabled={ticketType !== "LIMIT"} placeholder={ticketType === "LIMIT" ? fmt(q.ltp) : "At market"} value={ticketPrice} onChange={(e) => setTicketPrice(e.target.value)} />
+                </label>
+                <label>Stop loss
+                  <input type="number" step="0.05" placeholder="Optional" value={ticketSl} onChange={(e) => setTicketSl(e.target.value)} />
+                </label>
+                <label>Target
+                  <input type="number" step="0.05" placeholder="Optional" value={ticketTarget} onChange={(e) => setTicketTarget(e.target.value)} />
+                </label>
+              </div>
+
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.82rem", color: "var(--color-text-muted)", margin: "4px 0 12px" }}>
+                <span>Approx. {isBuy ? "premium" : "credit"}: <strong style={{ color: "#fff" }}>₹{fmt((estPrice || 0) * qty)}</strong></span>
+                <span>Avail. ₹{fmt(userProfile?.virtual_balance ?? 0, 0)}</span>
+              </div>
+
+              <button
+                disabled={placingOrder || (ticketType === "LIMIT" && !ticketPrice)}
+                onClick={handlePlaceTicket}
+                style={{ width: "100%", padding: "14px", borderRadius: "10px", border: "none", cursor: "pointer", background: accent, color: "#fff", fontWeight: "800", fontSize: "1rem" }}
+              >
+                {placingOrder ? "Placing…" : `${ticket.side} ${qty} @ ${ticketType === "LIMIT" ? fmt(Number(ticketPrice)) : "MARKET"}`}
+              </button>
+              <div style={{ fontSize: "0.72rem", color: "var(--color-text-muted)", textAlign: "center", marginTop: "8px" }}>
+                Paper trade · {marketSnap.source === "upstox" ? "fills at live bid/ask" : "simulated prices"} · virtual money
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {toast && (
+        <div className={`toast ${toast.ok ? "ok" : "err"}`} onClick={() => setToast(null)}>{toast.text}</div>
+      )}
 
       {/* Upcoming Soon Segment Modal */}
       {upcomingModal && (
