@@ -643,6 +643,30 @@ async def subscribe(payload: SubscriptionRequest, user_id: str = Depends(get_cur
     await db.refresh(sub)
     return {"subscription_id": sub.id}
 
+@app.get("/api/v1/subscriptions")
+async def list_subscriptions(user_id: str = Depends(get_current_user_id), db: AsyncSession = Depends(get_db)):
+    """The user's strategy runs, newest first (manual-trading holder excluded)."""
+    res = await db.execute(
+        select(StrategySubscription)
+        .where(StrategySubscription.user_id == user_id)
+        .order_by(StrategySubscription.created_at.desc())
+    )
+    return [
+        {
+            "subscription_id": s.id,
+            "strategy_version_id": s.strategy_version_id,
+            "status": s.status,
+            "quantity": s.quantity,
+            "product_type": s.product_type,
+            "max_profit": s.max_profit,
+            "max_loss": s.max_loss,
+            "config_json": s.config_json or {},
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+        }
+        for s in res.scalars().all()
+        if not (s.config_json or {}).get("manual")
+    ]
+
 @app.post("/api/v1/subscriptions/{id}/toggle")
 async def toggle_strategy(id: str, payload: ToggleRequest, user_id: str = Depends(get_current_user_id), db: AsyncSession = Depends(get_db)):
     query = select(StrategySubscription).where(StrategySubscription.id == id, StrategySubscription.user_id == user_id)
@@ -657,6 +681,17 @@ async def toggle_strategy(id: str, payload: ToggleRequest, user_id: str = Depend
             bypass = (sub.config_json or {}).get("bypass_scheduler", False)
             if not bypass:
                 raise HTTPException(status_code=400, detail="Cannot start strategy. Markets are closed.")
+
+        # One running copy per strategy: stop older ones (e.g. started before a page reload) so trades never double
+        others = await db.execute(select(StrategySubscription).where(
+            StrategySubscription.user_id == user_id,
+            StrategySubscription.strategy_version_id == sub.strategy_version_id,
+            StrategySubscription.status == "running",
+            StrategySubscription.id != sub.id,
+        ))
+        for old in others.scalars().all():
+            old.status = "stopped"
+            logger.info(f"Stopping older running copy sub={old.id} in favour of sub={sub.id}")
 
         sub.status = "running"
         await db.commit()

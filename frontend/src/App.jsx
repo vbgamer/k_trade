@@ -104,6 +104,7 @@ export default function App() {
       fetchTrades();
       fetchUpstoxStatus();
       fetchSnapshot();
+      fetchRunningStrategy();
       connectWebSocket();
     } else {
       localStorage.removeItem("token");
@@ -325,6 +326,29 @@ export default function App() {
       console.error("Error fetching trades:", err);
     } finally {
       setTradesLoading(false);
+    }
+  };
+
+  // Re-attach to a strategy that is already running (e.g. after reopening the app) so Halt controls it
+  const fetchRunningStrategy = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/subscriptions`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!res.ok) return;
+      const running = (await res.json()).find((s) => s.status === "running");
+      if (running) {
+        setSubscriptionId(running.subscription_id);
+        setEngineActive(true);
+        setQty(running.quantity);
+        setMaxProfit(running.max_profit);
+        setMaxLoss(running.max_loss);
+        setProductType(running.product_type);
+      } else {
+        setEngineActive(false);
+      }
+    } catch (err) {
+      console.error("Error loading strategy runs:", err);
     }
   };
 

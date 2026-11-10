@@ -198,3 +198,20 @@ def test_in_process_mode_resumes_running_strategies(client, make_user, monkeypat
     monkeypatch.setattr(main.start_strategy_task, "delay", lambda *_: pytest.fail("Celery used"))
     res = client.post(f"/api/v1/subscriptions/{sub_id}/toggle", headers=auth(token), json={"active": True})
     assert res.status_code == 200 and started.count(sub_id) == 2
+
+
+def test_starting_a_strategy_stops_older_running_copies(client, make_user, monkeypatch):
+    import app.main as main
+    monkeypatch.setattr(main, "start_strategy_in_process", lambda *_: None)
+    monkeypatch.setattr(main.settings, "RUN_STRATEGIES_IN_PROCESS", True)
+
+    _, _, token = make_user()
+    version_id = client.get("/api/v1/strategies").json()[0]["versions"][0]["id"]
+    body = {"strategy_version_id": version_id, "config_json": {"bypass_scheduler": True}}
+    first = client.post("/api/v1/subscriptions", headers=auth(token), json=body).json()["subscription_id"]
+    second = client.post("/api/v1/subscriptions", headers=auth(token), json=body).json()["subscription_id"]
+    for sub_id in (first, second):
+        assert client.post(f"/api/v1/subscriptions/{sub_id}/toggle", headers=auth(token), json={"active": True}).status_code == 200
+
+    runs = {s["subscription_id"]: s["status"] for s in client.get("/api/v1/subscriptions", headers=auth(token)).json()}
+    assert runs == {first: "stopped", second: "running"}
