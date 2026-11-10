@@ -212,5 +212,15 @@
         "best_day_rs": 4584.0
       }
     }
+  },
+  "walk_forward": {
+    "period": "2024-07 to 2026-07, retrained monthly",
+    "exit_rule": "t100s30eod",
+    "trades": 134,
+    "win_rate": 0.418,
+    "avg_ret_pct": -1.15,
+    "total_pnl_rs_1lot": -13048.0,
+    "max_drawdown_rs": 55357.0,
+    "verdict": "No proven edge yet: paper trading only"
   }
 }

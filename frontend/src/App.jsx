@@ -1124,7 +1124,9 @@ export default function App() {
                     )}
                     {bt && (
                       <div style={{ fontSize: "0.72rem", color: "var(--color-text-muted)", marginTop: "8px" }}>
-                        Backtest on unseen data: {bt.trades} trades, win {Math.round(bt.win_rate * 100)}%, P&amp;L ₹{fmt(bt.total_pnl_rs_1lot)} per lot. Paper trading only.
+                        Backtest on unseen data: {bt.trades} trades, win {Math.round(bt.win_rate * 100)}%, P&amp;L ₹{fmt(bt.total_pnl_rs_1lot)} per lot.
+                        {aiInfo.model?.walk_forward && ` Monthly-retrain test: ₹${fmt(aiInfo.model.walk_forward.total_pnl_rs_1lot)} over ${aiInfo.model.walk_forward.trades} trades.`}
+                        {" "}No proven edge yet — paper trading only.
                       </div>
                     )}
                   </div>
