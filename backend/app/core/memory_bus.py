@@ -19,6 +19,21 @@ market_snapshot: Dict[str, Any] = {"source": "simulator", "rows": []}
 # Extra instruments to keep quoting (e.g. open positions that drifted out of the chain window)
 tracked_keys: Set[str] = set()
 
+# Today's IST-minute-aligned bars per instrument, oldest first: {"minute": mins since midnight, open, high, low, close}
+minute_bars: Dict[str, List[Dict[str, Any]]] = {}
+
+# ATM-area option premiums recorded at each minute close: strike -> {minute: (ce_ltp, pe_ltp)}
+chain_history: Dict[int, Dict[int, Any]] = {}
+
+# Previous sessions' NIFTY closes for features: {"prev_close", "prev_day_ret", "day"}
+index_daily: Dict[str, Any] = {}
+
+# Latest AI agent status per user id (suggestion card on the Trade screen)
+ai_status: Dict[str, Dict[str, Any]] = {}
+
+# Channel/key on which a closed NIFTY minute bar is published (drives the ML agent)
+MINUTE_BAR_KEY = "NIFTY_1M"
+
 class MemoryPubSub:
     """
     In-memory Pub/Sub event bus to bypass Redis dependency during local development.

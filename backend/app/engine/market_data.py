@@ -1,8 +1,9 @@
 import asyncio
 import json
 import logging
+import math
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 import redis.asyncio as aioredis
 from sqlalchemy.future import select
@@ -12,8 +13,10 @@ from app.broker.upstox import (
     NIFTY_INDEX_KEY, UpstoxAuthError, UpstoxClient, build_chain_rows, nearest_expiry
 )
 from app.core.memory_bus import (
-    memory_bus, in_memory_ltps, in_memory_candles, in_memory_quotes, market_snapshot, tracked_keys
+    memory_bus, in_memory_ltps, in_memory_candles, in_memory_quotes, market_snapshot, tracked_keys,
+    index_daily, MINUTE_BAR_KEY
 )
+from app.engine import minute_bars as mb
 from app.services import upstox_session
 
 logger = logging.getLogger("market_data")
@@ -42,6 +45,8 @@ class MarketDataService:
         self._contracts: List[Dict[str, Any]] = []
         self._contracts_day: Optional[date] = None
         self._last_chain_at = 0.0
+        self._history_day: Optional[date] = None
+        self._history_tried_at = 0.0
 
     async def connect(self):
         try:
@@ -92,6 +97,9 @@ class MarketDataService:
         in_memory_quotes.clear()
         market_snapshot.clear()
         market_snapshot.update(source=source, rows=[])
+        mb._state["day"] = None  # forces minute bars / chain history to reset
+        index_daily.clear()
+        self._history_day = None
         self.candle_duration = settings.LIVE_CANDLE_SECONDS if source == "upstox" else self.sim_candle_duration
         self._last_chain_at = 0.0
 
@@ -166,6 +174,8 @@ class MarketDataService:
             in_memory_quotes[key] = {**q, "ts": now, "live": True}
             await self._ingest(key, q["ltp"], now)
 
+        await self._ensure_history(client, now)
+
         index_q = quotes.get(NIFTY_INDEX_KEY)
         if index_q:
             market_snapshot["spot"] = index_q["ltp"]
@@ -175,7 +185,27 @@ class MarketDataService:
                 if leg and leg["instrument_key"] in quotes:
                     q = quotes[leg["instrument_key"]]
                     leg.update(ltp=q["ltp"], bid=q["bid"], ask=q["ask"], oi=q["oi"] or leg.get("oi"))
+        await self._update_minute_bars(NIFTY_INDEX_KEY, quotes, now)
         await self._broadcast_quotes(quotes, now)
+
+    async def _ensure_history(self, client: UpstoxClient, now: float):
+        """Once a day: backfill today's NIFTY minute bars (restart-safe) and the previous sessions' closes."""
+        today = datetime.now(upstox_session.IST).date()
+        if self._history_day == today or now - self._history_tried_at < 60:
+            return
+        self._history_tried_at = now
+        try:
+            daily = [c for c in await client.get_daily_candles(NIFTY_INDEX_KEY, today, today - timedelta(days=12))
+                     if c["date"] < today]
+            if len(daily) >= 2:
+                index_daily.update(day=today, prev_close=daily[-1]["close"],
+                                   prev_day_ret=math.log(daily[-1]["close"] / daily[-2]["close"]))
+            intraday = [c for c in await client.get_intraday_candles(NIFTY_INDEX_KEY) if c["date"] == today]
+            added = mb.backfill(NIFTY_INDEX_KEY, intraday, now)
+            self._history_day = today
+            logger.info(f"NIFTY history ready: prev_close={index_daily.get('prev_close')} backfilled {added} minute bars")
+        except Exception as e:
+            logger.warning(f"Could not load NIFTY history yet (will retry): {e}")
 
     # --- Simulator --------------------------------------------------------------
 
@@ -211,9 +241,26 @@ class MarketDataService:
             atm_pe_key=(atm["pe"] or {}).get("instrument_key") if atm else None,
             rows=ordered, updated_at=now,
         )
+        await self._update_minute_bars(SIM_INDEX_KEY, quotes, now)
         await self._broadcast_quotes(quotes, now)
 
     # --- Shared -----------------------------------------------------------------
+
+    async def _update_minute_bars(self, index_key: str, quotes: Dict[str, Dict[str, Any]], now: float):
+        """Fold quotes into IST minute bars; when the NIFTY minute closes, snapshot premiums and publish it."""
+        closed_index = None
+        for key, q in quotes.items():
+            if q.get("ltp"):
+                closed = mb.update(key, q["ltp"], now)
+                if key == index_key and closed:
+                    closed_index = closed
+        if closed_index:
+            mb.record_chain(closed_index["minute"], market_snapshot.get("rows", []))
+            today, _ = mb.ist_minute(now)
+            m = closed_index["minute"]
+            candle = {**closed_index, "instrument_key": MINUTE_BAR_KEY,
+                      "time": f"{today.isoformat()} {m // 60:02d}:{m % 60:02d}"}
+            await memory_bus.publish(f"market:candles:{MINUTE_BAR_KEY}", json.dumps(candle))
 
     async def _broadcast_quotes(self, quotes: Dict[str, Dict[str, Any]], now: float):
         payload = {

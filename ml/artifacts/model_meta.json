@@ -1,0 +1,216 @@
+{
+  "exit_rule": "t100s30eod",
+  "threshold": 0.0024039090751208337,
+  "features": [
+    "ret_1",
+    "ret_3",
+    "ret_5",
+    "ret_10",
+    "ret_15",
+    "ret_30",
+    "vol_15",
+    "vol_30",
+    "range_15",
+    "rsi_14",
+    "ema9_dist",
+    "ema21_dist",
+    "ema9_21",
+    "ret_from_open",
+    "gap",
+    "prev_day_ret",
+    "day_range",
+    "pos_in_range",
+    "mins_since_open",
+    "weekday",
+    "days_to_expiry",
+    "is_expiry_day",
+    "ce_prem",
+    "pe_prem",
+    "straddle",
+    "ce_pe_skew",
+    "straddle_chg_5",
+    "straddle_chg_15"
+  ],
+  "sim": {
+    "target_pct": 1.0,
+    "stop_pct": 0.3,
+    "max_hold_min": 400,
+    "slippage_pct": 0.0025,
+    "taxes_pct": 0.0012,
+    "brokerage_rs": 40.0,
+    "lot_size": 65
+  },
+  "max_trades_per_day": 3,
+  "train_end": "2024-06-30",
+  "val_end": "2025-06-30",
+  "results": {
+    "validation": {
+      "trades": 67,
+      "trading_days": 248,
+      "win_rate": 0.493,
+      "avg_ret_pct": 7.88,
+      "total_pnl_rs_1lot": 58119.0,
+      "max_drawdown_rs": 34526.0,
+      "green_days_pct": 0.489,
+      "worst_day_rs": -6362.0,
+      "best_day_rs": 16593.0
+    },
+    "test": {
+      "trades": 57,
+      "trading_days": 225,
+      "win_rate": 0.386,
+      "avg_ret_pct": -0.78,
+      "total_pnl_rs_1lot": 7032.0,
+      "max_drawdown_rs": 28157.0,
+      "green_days_pct": 0.442,
+      "worst_day_rs": -8473.0,
+      "best_day_rs": 13656.0
+    }
+  },
+  "all_variants": {
+    "t100s30eod": {
+      "val": {
+        "trades": 67,
+        "trading_days": 248,
+        "win_rate": 0.493,
+        "avg_ret_pct": 7.88,
+        "total_pnl_rs_1lot": 58119.0,
+        "max_drawdown_rs": 34526.0,
+        "green_days_pct": 0.489,
+        "worst_day_rs": -6362.0,
+        "best_day_rs": 16593.0
+      },
+      "test": {
+        "trades": 57,
+        "trading_days": 225,
+        "win_rate": 0.386,
+        "avg_ret_pct": -0.78,
+        "total_pnl_rs_1lot": 7032.0,
+        "max_drawdown_rs": 28157.0,
+        "green_days_pct": 0.442,
+        "worst_day_rs": -8473.0,
+        "best_day_rs": 13656.0
+      }
+    },
+    "t10s10h15": {
+      "val": {
+        "trades": 77,
+        "trading_days": 248,
+        "win_rate": 0.558,
+        "avg_ret_pct": 0.73,
+        "total_pnl_rs_1lot": 4335.0,
+        "max_drawdown_rs": 6051.0,
+        "green_days_pct": 0.467,
+        "worst_day_rs": -3033.0,
+        "best_day_rs": 3521.0
+      },
+      "test": {
+        "trades": 52,
+        "trading_days": 225,
+        "win_rate": 0.442,
+        "avg_ret_pct": -1.77,
+        "total_pnl_rs_1lot": -12439.0,
+        "max_drawdown_rs": 13120.0,
+        "green_days_pct": 0.367,
+        "worst_day_rs": -3755.0,
+        "best_day_rs": 1893.0
+      }
+    },
+    "t15s8h30": {
+      "val": {
+        "trades": 130,
+        "trading_days": 248,
+        "win_rate": 0.431,
+        "avg_ret_pct": 0.05,
+        "total_pnl_rs_1lot": -42.0,
+        "max_drawdown_rs": 11589.0,
+        "green_days_pct": 0.412,
+        "worst_day_rs": -3050.0,
+        "best_day_rs": 3914.0
+      },
+      "test": {
+        "trades": 152,
+        "trading_days": 225,
+        "win_rate": 0.329,
+        "avg_ret_pct": -1.87,
+        "total_pnl_rs_1lot": -23482.0,
+        "max_drawdown_rs": 26205.0,
+        "green_days_pct": 0.369,
+        "worst_day_rs": -2904.0,
+        "best_day_rs": 3591.0
+      }
+    },
+    "t25s25h90": {
+      "val": {
+        "trades": 88,
+        "trading_days": 248,
+        "win_rate": 0.466,
+        "avg_ret_pct": -0.12,
+        "total_pnl_rs_1lot": -3461.0,
+        "max_drawdown_rs": 13131.0,
+        "green_days_pct": 0.538,
+        "worst_day_rs": -5530.0,
+        "best_day_rs": 3416.0
+      },
+      "test": {
+        "trades": 117,
+        "trading_days": 225,
+        "win_rate": 0.41,
+        "avg_ret_pct": -2.27,
+        "total_pnl_rs_1lot": -21673.0,
+        "max_drawdown_rs": 24059.0,
+        "green_days_pct": 0.404,
+        "worst_day_rs": -5350.0,
+        "best_day_rs": 3007.0
+      }
+    },
+    "t30s12h60": {
+      "val": {
+        "trades": 189,
+        "trading_days": 248,
+        "win_rate": 0.407,
+        "avg_ret_pct": 0.88,
+        "total_pnl_rs_1lot": 17974.0,
+        "max_drawdown_rs": 11815.0,
+        "green_days_pct": 0.474,
+        "worst_day_rs": -5536.0,
+        "best_day_rs": 7784.0
+      },
+      "test": {
+        "trades": 217,
+        "trading_days": 225,
+        "win_rate": 0.378,
+        "avg_ret_pct": -1.22,
+        "total_pnl_rs_1lot": -20002.0,
+        "max_drawdown_rs": 25513.0,
+        "green_days_pct": 0.402,
+        "worst_day_rs": -4858.0,
+        "best_day_rs": 4655.0
+      }
+    },
+    "t50s20h120": {
+      "val": {
+        "trades": 126,
+        "trading_days": 248,
+        "win_rate": 0.452,
+        "avg_ret_pct": 3.93,
+        "total_pnl_rs_1lot": 54224.0,
+        "max_drawdown_rs": 13091.0,
+        "green_days_pct": 0.507,
+        "worst_day_rs": -4515.0,
+        "best_day_rs": 13343.0
+      },
+      "test": {
+        "trades": 75,
+        "trading_days": 225,
+        "win_rate": 0.293,
+        "avg_ret_pct": -4.64,
+        "total_pnl_rs_1lot": -37590.0,
+        "max_drawdown_rs": 35585.0,
+        "green_days_pct": 0.354,
+        "worst_day_rs": -6087.0,
+        "best_day_rs": 4584.0
+      }
+    }
+  }
+}

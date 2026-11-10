@@ -4,9 +4,9 @@ Used for market data only; orders are filled by the paper engine at these live p
 Docs: https://upstox.com/developer/api-documentation/open-api/
 """
 import logging
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import httpx
 
@@ -109,6 +109,27 @@ class UpstoxClient:
                     }
         return out
 
+    async def _candles(self, path: str) -> List[Dict[str, Any]]:
+        """Candle endpoints return [[ts, o, h, l, c, volume, oi], ...] newest first; we return oldest first."""
+        async with self._client() as client:
+            res = await client.get(path)
+        raw = (self._check(res).get("data") or {}).get("candles") or []
+        out = []
+        for c in raw:
+            ts = datetime.fromisoformat(c[0])
+            out.append({"ts": ts, "date": ts.date(), "minute": ts.hour * 60 + ts.minute,
+                        "open": float(c[1]), "high": float(c[2]), "low": float(c[3]), "close": float(c[4])})
+        return sorted(out, key=lambda x: x["ts"])
+
+    async def get_intraday_candles(self, instrument_key: str, interval: str = "1minute") -> List[Dict[str, Any]]:
+        """Today's candles so far (lets the agent recover a full day of bars after a restart)."""
+        return await self._candles(f"/v2/historical-candle/intraday/{quote(instrument_key, safe='')}/{interval}")
+
+    async def get_daily_candles(self, instrument_key: str, to_date: date, from_date: date) -> List[Dict[str, Any]]:
+        return await self._candles(
+            f"/v2/historical-candle/{quote(instrument_key, safe='')}/day/{to_date.isoformat()}/{from_date.isoformat()}"
+        )
+
     async def get_option_contracts(self, underlying_key: str = NIFTY_INDEX_KEY) -> List[Dict[str, Any]]:
         async with self._client() as client:
             res = await client.get("/v2/option/contract", params={"instrument_key": underlying_key})
@@ -151,6 +172,7 @@ def build_chain_rows(chain: List[Dict[str, Any]], contracts: List[Dict[str, Any]
             "bid": md.get("bid_price"),
             "ask": md.get("ask_price"),
             "oi": md.get("oi"),
+            "prev_oi": md.get("prev_oi"),
             "volume": md.get("volume"),
             "prev_close": md.get("close_price"),
             "iv": greeks.get("iv"),

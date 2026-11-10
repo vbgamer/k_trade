@@ -45,6 +45,11 @@ export default function App() {
   // Running engine states
   const [strategies, setStrategies] = useState([]);
   const [selectedStrategy, setSelectedStrategy] = useState(null);
+  const [runningVersionId, setRunningVersionId] = useState(null);
+  const [aiInfo, setAiInfo] = useState(null);
+  const [aiMode, setAiMode] = useState("auto");
+  const [aiMaxTrades, setAiMaxTrades] = useState(3);
+  const isAiStrategy = selectedStrategy?.slug === "aiOptionsAgent";
   const [subscriptionId, setSubscriptionId] = useState(null);
   const [engineActive, setEngineActive] = useState(false);
   const [positions, setPositions] = useState([]);
@@ -104,6 +109,7 @@ export default function App() {
       fetchTrades();
       fetchUpstoxStatus();
       fetchSnapshot();
+      fetchAiStatus();
       fetchRunningStrategy();
       connectWebSocket();
     } else {
@@ -113,6 +119,13 @@ export default function App() {
       closeWebSocket();
     };
   }, [token]);
+
+  // Show the strategy that is actually running (after reopening the app)
+  useEffect(() => {
+    if (!runningVersionId || strategies.length === 0) return;
+    const match = strategies.find((s) => (s.versions || []).some((v) => v.id === runningVersionId));
+    if (match) setSelectedStrategy(match);
+  }, [runningVersionId, strategies]);
 
   // Refetch trades when filters change
   useEffect(() => {
@@ -126,6 +139,7 @@ export default function App() {
     if (!token) return;
     const id = setInterval(() => {
       fetchSnapshot();
+      fetchAiStatus();
       fetchUpstoxStatus();
     }, 30000);
     return () => clearInterval(id);
@@ -344,6 +358,9 @@ export default function App() {
         setMaxProfit(running.max_profit);
         setMaxLoss(running.max_loss);
         setProductType(running.product_type);
+        setRunningVersionId(running.strategy_version_id);
+        if (running.config_json?.ai_mode) setAiMode(running.config_json.ai_mode);
+        if (running.config_json?.max_trades_per_day) setAiMaxTrades(running.config_json.max_trades_per_day);
       } else {
         setEngineActive(false);
       }
@@ -360,6 +377,17 @@ export default function App() {
       if (res.ok) setUpstox(await res.json());
     } catch (err) {
       console.error("Error loading Upstox status:", err);
+    }
+  };
+
+  const fetchAiStatus = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/ai/status`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) setAiInfo(await res.json());
+    } catch (err) {
+      console.error("Error loading AI status:", err);
     }
   };
 
@@ -541,7 +569,9 @@ export default function App() {
           product_type: productType,
           max_profit: Number(maxProfit),
           max_loss: Number(maxLoss),
-          config_json: { timeframeMin: timeframe, bypass_scheduler: bypassScheduler }
+          config_json: isAiStrategy
+            ? { bypass_scheduler: bypassScheduler, ai_mode: aiMode, max_trades_per_day: aiMaxTrades }
+            : { timeframeMin: timeframe, bypass_scheduler: bypassScheduler }
         })
       });
 
@@ -1057,6 +1087,50 @@ export default function App() {
                 </div>
               </div>
 
+              {/* AI agent */}
+              {aiInfo && (aiInfo.status || aiInfo.model?.deployed) && (() => {
+                const st = aiInfo.status;
+                const bt = aiInfo.model?.backtest;
+                const pct = (v) => (v == null ? "—" : `${v >= 0 ? "+" : ""}${(v * 100).toFixed(2)}%`);
+                const stale = st && Date.now() / 1000 - st.updated_at > 180;
+                return (
+                  <div className="glass-panel" style={{ padding: "14px 16px", borderLeft: `3px solid ${st?.signal ? "var(--color-green)" : "var(--border-glow)"}` }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+                      <span style={{ fontWeight: "700" }}>🤖 AI Agent</span>
+                      <span style={{ fontSize: "0.75rem", color: "var(--color-text-muted)" }}>
+                        {st ? `${st.mode === "auto" ? "Auto" : "Suggest"} · ${st.trades_today}/${st.max_trades} trades` : "Not running"}
+                      </span>
+                    </div>
+                    {st ? (
+                      <>
+                        <div style={{ fontSize: "0.92rem", marginBottom: "6px" }}>{stale ? "No update for 3+ min (market closed?)" : st.message}</div>
+                        {st.pred_ce != null && (
+                          <div style={{ display: "flex", gap: "16px", fontFamily: "var(--font-mono)", fontSize: "0.82rem" }}>
+                            <span>CE {pct(st.pred_ce)}</span>
+                            <span>PE {pct(st.pred_pe)}</span>
+                            <span style={{ color: "var(--color-text-muted)" }}>need &gt; {pct(st.threshold)}</span>
+                          </div>
+                        )}
+                        {st.status === "in_trade" && (
+                          <div style={{ fontFamily: "var(--font-mono)", fontSize: "0.82rem", color: "var(--color-text-muted)" }}>
+                            Entry ₹{fmt(st.entry_price)} · SL ₹{fmt(st.stop)} · Target ₹{fmt(st.target)}
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <div style={{ fontSize: "0.85rem", color: "var(--color-text-muted)" }}>
+                        Start "AI Options Agent (ML)" from the Dashboard to get live suggestions.
+                      </div>
+                    )}
+                    {bt && (
+                      <div style={{ fontSize: "0.72rem", color: "var(--color-text-muted)", marginTop: "8px" }}>
+                        Backtest on unseen data: {bt.trades} trades, win {Math.round(bt.win_rate * 100)}%, P&amp;L ₹{fmt(bt.total_pnl_rs_1lot)} per lot. Paper trading only.
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
               {/* Open positions */}
               <div className="glass-panel" style={{ padding: "14px 16px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
@@ -1150,10 +1224,33 @@ export default function App() {
                     <label style={{ fontSize: "0.82rem", color: "var(--color-text-muted)", display: "block", marginBottom: "5px" }}>
                       Active Strategy Script
                     </label>
-                    <select style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "#110c1c", color: "#fff", border: "1px solid var(--border-glow)" }}>
-                      <option>Nifty ATM WMA5/SMA1 Crossover Call (Heikin-Ashi)</option>
+                    <select
+                      value={selectedStrategy?.id || ""}
+                      disabled={engineActive}
+                      onChange={(e) => setSelectedStrategy(strategies.find((s) => s.id === e.target.value) || null)}
+                      style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "#110c1c", color: "#fff", border: "1px solid var(--border-glow)" }}
+                    >
+                      {strategies.map((s) => (
+                        <option key={s.id} value={s.id}>{s.name}</option>
+                      ))}
                     </select>
                   </div>
+
+                  {isAiStrategy && (
+                    <div style={{ display: "flex", gap: "10px" }}>
+                      <div style={{ width: "50%" }}>
+                        <label style={{ fontSize: "0.82rem", color: "var(--color-text-muted)", display: "block", marginBottom: "5px" }}>AI Mode</label>
+                        <select value={aiMode} disabled={engineActive} onChange={(e) => setAiMode(e.target.value)} style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "#110c1c", color: "#fff", border: "1px solid var(--border-glow)" }}>
+                          <option value="auto">Auto trade</option>
+                          <option value="suggest">Suggest only</option>
+                        </select>
+                      </div>
+                      <div style={{ width: "50%" }}>
+                        <label style={{ fontSize: "0.82rem", color: "var(--color-text-muted)", display: "block", marginBottom: "5px" }}>Max trades / day</label>
+                        <input type="number" min={1} max={10} value={aiMaxTrades} disabled={engineActive} onChange={(e) => setAiMaxTrades(Number(e.target.value))} style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "#110c1c", color: "#fff", border: "1px solid var(--border-glow)" }} />
+                      </div>
+                    </div>
+                  )}
 
                   <div style={{ display: "flex", gap: "10px" }}>
                     <div style={{ width: "50%" }}>

@@ -36,6 +36,7 @@ from app.services import upstox_session
 from app.services.audit import log_audit
 # Import strategy to trigger registration
 from app.strategies.kaushalcustomWMASMACall1.strategy import KaushalCustomWMASMACall1
+from app.strategies.aiOptionsAgent.strategy import AIOptionsAgent
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -682,10 +683,10 @@ async def toggle_strategy(id: str, payload: ToggleRequest, user_id: str = Depend
             if not bypass:
                 raise HTTPException(status_code=400, detail="Cannot start strategy. Markets are closed.")
 
-        # One running copy per strategy: stop older ones (e.g. started before a page reload) so trades never double
+        # One running engine per user: stop anything else running (an older copy started before a page reload,
+        # or a different strategy) so trades never double up and the dashboard always controls what is running
         others = await db.execute(select(StrategySubscription).where(
             StrategySubscription.user_id == user_id,
-            StrategySubscription.strategy_version_id == sub.strategy_version_id,
             StrategySubscription.status == "running",
             StrategySubscription.id != sub.id,
         ))
@@ -788,6 +789,25 @@ async def upstox_disconnect(user_id: str = Depends(get_current_user_id), db: Asy
 async def get_market_snapshot(user_id: str = Depends(get_current_user_id)):
     """Option chain window around ATM with live prices; refreshed by the market data loop."""
     return market_snapshot
+
+@app.get("/api/v1/ai/status")
+async def get_ai_status(user_id: str = Depends(get_current_user_id)):
+    """The AI agent's latest view for this user, plus how the deployed model did in its backtest."""
+    from app.core.memory_bus import ai_status
+    from app.ml.agent import load_models
+    models = load_models()
+    meta = (models or {}).get("meta", {})
+    return {
+        "status": ai_status.get(user_id),
+        "model": {
+            "deployed": models is not None,
+            "exit_rule": meta.get("exit_rule"),
+            "sim": meta.get("sim"),
+            "trained_until": meta.get("train_end"),
+            "backtest": (meta.get("results") or {}).get("test"),
+            "walk_forward": meta.get("walk_forward"),
+        } if models else {"deployed": False},
+    }
 
 # --- MANUAL ORDERS (Trade screen) ---
 

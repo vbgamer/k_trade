@@ -8,6 +8,7 @@ from app.engine.registry import StrategyRegistry
 from app.db.models import StrategySubscription, StrategyVersion, StrategyDefinition, Position
 from app.services.execution import ExecutionService
 from app.engine.rms import is_exit_order, size_from_risk
+from app.services.audit import log_audit
 
 logger = logging.getLogger("runtime")
 
@@ -65,7 +66,9 @@ class StrategyRuntime:
                 "quantity": sub.quantity,
                 "product_type": sub.product_type,
                 "max_profit": sub.max_profit,
-                "max_loss": sub.max_loss
+                "max_loss": sub.max_loss,
+                "subscription_id": sub.id,
+                "user_id": sub.user_id,
             })
             
             self.strategy_instance = strategy_class(config)
@@ -153,7 +156,7 @@ class StrategyRuntime:
             execution_service = ExecutionService(db)
             logger.info(f"Signal detected. Placing {action} order for sub={self.subscription_id} key={instrument_key}")
             
-            await execution_service.execute_trade(
+            result = await execution_service.execute_trade(
                 subscription_id=self.subscription_id,
                 side=action,
                 instrument_key=instrument_key,
@@ -165,3 +168,19 @@ class StrategyRuntime:
                 stop_loss=stop_loss,
                 target=target
             )
+
+            # ML agent journal: what it saw and predicted, plus the outcome, for retraining on its own trades
+            journal = signal_intent.get("journal")
+            if journal:
+                try:
+                    sub = await db.get(StrategySubscription, self.subscription_id)
+                    await log_audit(
+                        db=db, user_id=sub.user_id, event_type="AI_TRADE_JOURNAL",
+                        message=f"AI {action} {signal_intent.get('trading_symbol') or instrument_key}: "
+                                f"{(result or {}).get('status')}",
+                        metadata_json={**journal, "action": action, "instrument_key": instrument_key,
+                                       "client_order_id": client_order_id, "candle_time": str(candle_ts),
+                                       "result": result},
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not write AI journal: {e}")
