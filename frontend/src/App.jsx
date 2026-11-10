@@ -89,6 +89,7 @@ export default function App() {
   // WebSocket & Terminal
   const ws = useRef(null);
   const sourceRef = useRef("simulator");
+  const atmRef = useRef({ key: null, symbol: "" }); // current ATM call, for the dashboard sparkline
   const terminalEndRef = useRef(null);
 
   // Load session data
@@ -189,9 +190,11 @@ export default function App() {
               : { ...prev, spot: data.spot ?? prev.spot }
           );
         } else if (event_type === "TickUpdate") {
+          // Candles arrive for every quoted instrument (index + whole chain); chart only the ATM call
+          if (!atmRef.current.key || data.instrument_key !== atmRef.current.key) return;
           const ltp = data.ltp;
           setCurrentLtp(ltp);
-          setCurrentStrike(data.instrument_key.split("|")[-1] || data.instrument_key);
+          setCurrentStrike(atmRef.current.symbol);
           setPriceHistory((prev) => {
             const next = [...prev, ltp];
             return next.slice(-40);
@@ -345,6 +348,15 @@ export default function App() {
         const data = await res.json();
         sourceRef.current = data.source;
         setMarketSnap(data);
+        if (data.atm_ce_key && data.atm_ce_key !== atmRef.current.key) {
+          // ATM strike moved: start a fresh chart for the new contract
+          const atmRow = (data.rows || []).find((r) => r.ce && r.ce.instrument_key === data.atm_ce_key);
+          const symbol = atmRow ? atmRow.ce.trading_symbol : data.atm_ce_key;
+          atmRef.current = { key: data.atm_ce_key, symbol };
+          setCurrentStrike(symbol);
+          setCurrentLtp(atmRow?.ce?.ltp ?? null);
+          setPriceHistory([]);
+        }
       }
     } catch (err) {
       console.error("Error loading market snapshot:", err);
@@ -364,6 +376,7 @@ export default function App() {
     n == null || Number.isNaN(Number(n)) ? "–" : Number(n).toLocaleString("en-IN", { minimumFractionDigits: digits, maximumFractionDigits: digits });
 
   const lotSize = marketSnap.lot_size || 1;
+  const openPositionsAll = positions.filter((p) => p.quantity !== 0);
 
   const openTicket = (leg, side) => {
     setTicket({ instrument_key: leg.instrument_key, trading_symbol: leg.trading_symbol, side, base: leg });
@@ -608,36 +621,21 @@ export default function App() {
     }
   };
 
-  const handleExecuteDemoTrade = async (side) => {
+  // Quick buttons trade 1 lot of the current ATM call through the same order path as the Trade screen
+  const handleExecuteDemoTrade = (side) => {
     setErrorMsg("");
-    try {
-      const symbol = selectedSegment === "fno" ? "NIFTY26JUL24300CE" : "NIFTY50-INDEX";
-      const seg = selectedSegment === "fno" ? "FNO" : "INTRADAY";
-
-      const res = await fetch(`${API_BASE}/api/v1/paper-trading/execute-demo-trade`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`
-        },
-        body: JSON.stringify({
-          side,
-          quantity: Number(qty),
-          segment: seg,
-          symbol
-        })
-      });
-
-      if (!res.ok) throw new Error("Failed to execute paper trade.");
-      const data = await res.json();
-      addTerminalLog("PaperBroker", `Executed ${side} ${qty} qty of ${symbol} @ ₹${data.result.fill_price}`);
-      fetchPositions();
-      fetchPortfolioSummary();
-      fetchTrades();
-      fetchUserProfile();
-    } catch (err) {
-      setErrorMsg(err.message);
+    if (!atmRef.current.key) {
+      setErrorMsg("Option chain not loaded yet. Try again in a few seconds.");
+      return;
     }
+    submitOrder({
+      instrument_key: atmRef.current.key,
+      trading_symbol: atmRef.current.symbol,
+      side,
+      quantity: lotSize,
+      order_type: "MARKET",
+      product_type: "MIS"
+    });
   };
 
   const handleResetCapital = async () => {
@@ -1201,20 +1199,20 @@ export default function App() {
                   ⚡ Quick Paper Trading Actions
                 </h4>
                 <p style={{ fontSize: "0.78rem", color: "var(--color-text-muted)", marginBottom: "12px" }}>
-                  Manually trigger a simulated paper order to test routing & watch P&L update live.
+                  Paper order for 1 lot of the current ATM call at live bid/ask. Watch P&L update live.
                 </p>
                 <div style={{ display: "flex", gap: "10px" }}>
                   <button
                     onClick={() => handleExecuteDemoTrade("BUY")}
                     style={{ flex: 1, padding: "10px", borderRadius: "6px", background: "rgba(16, 185, 129, 0.2)", color: "var(--color-green)", border: "1px solid rgba(16, 185, 129, 0.4)", fontWeight: "700", cursor: "pointer" }}
                   >
-                    + BUY 50 Qty
+                    + BUY 1 Lot ATM CE
                   </button>
                   <button
                     onClick={() => handleExecuteDemoTrade("SELL")}
                     style={{ flex: 1, padding: "10px", borderRadius: "6px", background: "rgba(239, 68, 68, 0.2)", color: "var(--color-red)", border: "1px solid rgba(239, 68, 68, 0.4)", fontWeight: "700", cursor: "pointer" }}
                   >
-                    - SELL 50 Qty
+                    - SELL 1 Lot ATM CE
                   </button>
                 </div>
               </div>
@@ -1256,14 +1254,14 @@ export default function App() {
                   
                   {/* Position state details */}
                   <div style={{ textAlign: "right" }}>
-                    <span className={positions.length > 0 ? "badge-active" : "badge-upcoming"}>
-                      {positions.length > 0 ? "POSITION ACTIVE" : "NO OPEN POSITION"}
+                    <span className={openPositionsAll.length > 0 ? "badge-active" : "badge-upcoming"}>
+                      {openPositionsAll.length > 0 ? "POSITION ACTIVE" : "NO OPEN POSITION"}
                     </span>
                     <p style={{ color: "#fff", fontWeight: "600", marginTop: "8px" }}>
-                      {positions.length > 0 ? positions[0].trading_symbol : "Waiting for crossover"}
+                      {openPositionsAll.length > 0 ? openPositionsAll[0].trading_symbol : "Waiting for crossover"}
                     </p>
                     <p style={{ fontSize: "0.8rem", color: "var(--color-text-muted)" }}>
-                      {positions.length > 0 ? `${positions[0].quantity} Qty @ Avg ₹${positions[0].average_price}` : "Heikin-Ashi signals listening"}
+                      {openPositionsAll.length > 0 ? `${openPositionsAll[0].quantity} Qty @ Avg ₹${openPositionsAll[0].average_price}` : "Heikin-Ashi signals listening"}
                     </p>
                   </div>
                 </div>
@@ -1277,7 +1275,7 @@ export default function App() {
                     {currentStrike}
                   </h4>
                   <h3 style={{ fontSize: "2rem", color: "var(--color-cyan)", textShadow: "var(--shadow-neon-cyan)", margin: 0 }}>
-                    ₹{currentLtp.toFixed(2)}
+                    ₹{fmt(currentLtp)}
                   </h3>
                 </div>
               </div>
@@ -1289,7 +1287,7 @@ export default function App() {
                     Real-time Option Contract Tick Sparkline ({currentStrike})
                   </h4>
                   <span style={{ fontSize: "0.78rem", color: "var(--color-cyan)" }}>
-                    LTP: ₹{currentLtp.toFixed(2)}
+                    LTP: ₹{fmt(currentLtp)}
                   </span>
                 </div>
                 <div style={{ background: "rgba(0,0,0,0.45)", borderRadius: "8px", padding: "10px", display: "flex", justifyContent: "center", overflow: "hidden" }}>

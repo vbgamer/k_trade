@@ -20,6 +20,16 @@ engine = create_async_engine(
     echo=False,
 )
 
+if "sqlite" in db_url:
+    # SQLite ignores foreign keys unless asked; enforce them so dev/tests behave like Postgres
+    from sqlalchemy import event
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_sqlite_fks(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
 async_session_maker = async_sessionmaker(
     engine,
     autocommit=False,

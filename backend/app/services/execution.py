@@ -200,8 +200,8 @@ class ExecutionService:
                     user_id=user_id,
                     event_type="ORDER_FILLED",
                     message=f"Order Filled. Price={fill_price}, Slippage={slippage}, Fees={brokerage_fees}",
-                    broker_order_id=broker_order_id,
-                    metadata_json={"fill_price": fill_price, "slippage": slippage}
+                    broker_order_id=order.id,  # FK to broker_orders.id (not the broker's own order reference)
+                    metadata_json={"fill_price": fill_price, "slippage": slippage, "broker_ref": broker_order_id}
                 )
                 
                 return {
