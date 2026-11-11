@@ -20,11 +20,12 @@ ART = os.path.join(HERE, "artifacts")
 DEST = os.path.join(ROOT, "backend", "app", "ml", "models")
 
 
-KEEP = ("split_feature", "threshold", "default_left", "leaf_value", "decision_type", "missing_type")
+KEEP = ("split_feature", "threshold", "default_left", "leaf_value", "decision_type", "missing_type",
+        "internal_value")  # internal_value powers the per-prediction explanation (GBMModel.explain)
 
 
 def _slim(node):
-    """Keep only what the evaluator needs (drops gains, counts, internal values)."""
+    """Keep only what the evaluator and explainer need (drops gains, counts)."""
     out = {k: node[k] for k in KEEP if k in node}
     for child in ("left_child", "right_child"):
         if child in node:
@@ -49,7 +50,17 @@ def main():
         err = max(abs(a - b) for a, b in zip(ref, mine))
         print(f"{side}: {booster.num_trees()} trees, {os.path.getsize(out)/1e6:.1f} MB, max abs diff {err:.2e}")
         assert err < 1e-9, "pure-python evaluator disagrees with lightgbm"
+        rows = sample[dump["feature_names"]].head(50).to_dict("records")
+        ex_err = max(abs(e["base"] + sum(e["contributions"].values()) - p)
+                     for e, p in zip((py.explain(r) for r in rows), mine))
+        print(f"{side}: explanation max abs diff {ex_err:.2e}")
+        assert ex_err < 1e-9, "explanations do not add up to the prediction"
     shutil.copy(os.path.join(ART, "model_meta.json"), os.path.join(DEST, "model_meta.json"))
+    report = os.path.join(ART, "training_report.json")  # built by ml/report.py, shown in the admin AI Lab
+    if os.path.exists(report):
+        shutil.copy(report, os.path.join(DEST, "training_report.json"))
+    else:
+        print("note: no training_report.json yet; run ml/report.py then export again for the AI Lab charts")
     print(f"exported to {DEST}")
 
 

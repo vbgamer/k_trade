@@ -273,3 +273,70 @@ def test_backfilled_bars_are_json_safe_when_they_close():
     closed = mb.update("K", 1.6, now)
     assert closed["minute"] == 714
     _json.dumps(closed)  # must not raise
+
+
+# --- admin AI Lab -----------------------------------------------------------------
+
+def test_explanations_add_up_to_the_prediction():
+    models = agent.load_models()
+    assert models["ce"].explainable, "re-export models with ml/export_model.py (keeps internal_value)"
+    _seed_market(10 * 60 + 30)
+    f, _, _ = agent.build_live_features(
+        bars=minute_bars[INDEX_KEY], rows=market_snapshot["rows"], chain_hist=chain_history, today=DAY,
+        expiry=EXPIRY, prev_close=23900.0, prev_day_ret=0.004)
+    for side in ("ce", "pe"):
+        ex = models[side].explain(f)
+        assert ex["base"] + sum(ex["contributions"].values()) == pytest.approx(models[side].predict(f), abs=1e-12)
+
+
+def test_live_decision_and_minute_score_log():
+    from app.core.memory_bus import ai_score_log
+    from app.ml import live
+    _seed_market(10 * 60 + 30)
+    d = live.decide(_ist(10, 31, 5))
+    assert d["status"] == "ok" and d["minute"] == 630 and d["time"] == "10:31" and d["in_window"]
+    assert d["decision"].startswith(("BUY", "WAIT"))
+    assert len(d["explain"]["ce"]["reasons"]) == live.TOP_REASONS
+    ai_score_log.update(day=None, points=[])
+    assert live.record_minute(_ist(10, 31, 5))["minute"] == 630
+    assert live.record_minute(_ist(10, 31, 40)) is None  # one point per minute
+    assert len(ai_score_log["points"]) == 1
+    market_snapshot.pop("expiry")
+    assert live.decide(_ist(10, 31, 5))["status"] == "waiting"
+
+
+def test_journal_pairs_entries_with_exits():
+    from app.ml import live
+    rows = [
+        {"user_id": "u", "user": "a@x", "at": "t1", "symbol": "N1CE",
+         "metadata": {"action": "BUY", "instrument_key": "K1", "side": "CE", "pred_ce": 0.05, "pred_pe": -0.1,
+                      "threshold": 0.002, "result": {"status": "FILLED", "fill_price": 100.0}}},
+        {"user_id": "u", "user": "a@x", "at": "t2", "symbol": "N1CE",
+         "metadata": {"action": "SELL", "instrument_key": "K1", "exit_reason": "stop",
+                      "result": {"status": "FILLED", "fill_price": 70.0}}},
+        {"user_id": "u", "user": "a@x", "at": "t3", "symbol": "N2PE",
+         "metadata": {"action": "BUY", "instrument_key": "K2", "side": "PE", "pred_ce": 0.0, "pred_pe": 0.03,
+                      "result": {"status": "FILLED", "fill_price": 50.0}}},
+    ]
+    newest, oldest = live.pair_journal(rows)
+    assert newest["status"] == "open" and newest["pred_pct"] == 3.0
+    assert oldest["status"] == "closed" and oldest["actual_pct"] == -30.0 and oldest["exit_reason"] == "stop"
+    assert oldest["pred_pct"] == 5.0 and oldest["model_was_right"] is False
+
+
+def test_ai_lab_is_admin_only(client, make_user, monkeypatch):
+    from app.core.config import settings
+    email, _, token = make_user()
+    h = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(settings, "ADMIN_EMAILS", "")
+    assert client.get("/api/v1/admin/ai-lab", headers=h).status_code == 403
+    assert client.get("/api/v1/user/profile", headers=h).json()["is_admin"] is False
+    monkeypatch.setattr(settings, "ADMIN_EMAILS", f"someone@else.com, {email.upper()}")
+    assert client.get("/api/v1/user/profile", headers=h).json()["is_admin"] is True
+    res = client.get("/api/v1/admin/ai-lab", headers=h)
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["deployed"] and body["report"]["model"]["features"] == FEATURE_NAMES
+    assert {"train", "validation", "test", "rounds"} <= set(body["report"]["learning_curves"]["ce"])
+    assert body["journal"] == [] and "status" in body["live"]
+    assert client.get("/api/v1/admin/ai-lab").status_code in (401, 403)

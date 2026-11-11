@@ -20,7 +20,7 @@ from app.core.migrations import run_migrations
 from app.core.security import hash_password, verify_password, generate_jwt, decode_jwt, encrypt, decrypt
 from app.db.models import (
     User, BrokerCredential, StrategyDefinition,
-    StrategyVersion, StrategySubscription, Position, BrokerOrder, Trade
+    StrategyVersion, StrategySubscription, Position, BrokerOrder, Trade, AuditLog
 )
 from app.schemas import (
     RegisterRequest, LoginRequest, BrokerCredentialsRequest, BrokerVerifyRequest,
@@ -351,7 +351,8 @@ async def get_profile(user_id: str = Depends(get_current_user_id), db: AsyncSess
         "first_name": user.first_name,
         "last_name": user.last_name,
         "virtual_balance": user.virtual_balance or 500000.0,
-        "is_active": user.is_active
+        "is_active": user.is_active,
+        "is_admin": user.email.lower() in settings.admin_emails,
     }
 
 @app.post("/api/v1/broker/credentials")
@@ -890,6 +891,48 @@ async def get_ai_status(user_id: str = Depends(get_current_user_id)):
             "backtest": (meta.get("results") or {}).get("test"),
             "walk_forward": meta.get("walk_forward"),
         } if models else {"deployed": False},
+    }
+
+# --- ADMIN: AI LAB ---
+
+async def require_admin(user_id: str = Depends(get_current_user_id), db: AsyncSession = Depends(get_db)) -> str:
+    user = await db.get(User, user_id)
+    if not user or user.email.lower() not in settings.admin_emails:
+        raise HTTPException(status_code=403, detail="Admins only")
+    return user_id
+
+def _journal_symbol(message: str) -> str:
+    parts = (message or "").split(" ")  # "AI BUY NIFTY25N1325500CE: FILLED"
+    return parts[2].rstrip(":") if len(parts) > 2 else ""
+
+@app.get("/api/v1/admin/ai-lab")
+async def admin_ai_lab(_: str = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+    """Everything about the model for the admin: how it was trained, what it thinks now and why, and how its
+    own live trades turned out (predicted reward vs actual)."""
+    from app.core.memory_bus import ai_score_log, ai_status
+    from app.ml import live as ml_live
+    from app.ml.agent import load_models
+    from app.services.upstox_session import IST
+
+    models = load_models()
+    rows = (await db.execute(
+        select(AuditLog, User.email).join(User, User.id == AuditLog.user_id)
+        .where(AuditLog.event_type == "AI_TRADE_JOURNAL")
+        .order_by(AuditLog.created_at.desc()).limit(400)
+    )).all()
+    journal = [{"user_id": a.user_id, "user": email, "at": a.created_at.isoformat() + "Z",
+                "symbol": _journal_symbol(a.message), "metadata": a.metadata_json or {}}
+               for a, email in reversed(rows)]
+    return {
+        "deployed": models is not None,
+        "meta": (models or {}).get("meta"),
+        "report": ml_live.load_report(),
+        "live": ml_live.decide(datetime.datetime.now(IST)),
+        "score_log": ai_score_log.get("points", []),
+        "agents_running": [{"mode": s.get("mode"), "status": s.get("status"), "message": s.get("message"),
+                            "trades_today": s.get("trades_today")} for s in ai_status.values()],
+        "journal": ml_live.pair_journal(journal),
+        "market_source": market_snapshot.get("source"),
     }
 
 # --- MANUAL ORDERS (Trade screen) ---

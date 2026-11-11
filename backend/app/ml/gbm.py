@@ -37,3 +37,32 @@ class GBMModel:
     def predict(self, features: Dict[str, float]) -> float:
         x = [float(features.get(n, float("nan"))) for n in self.feature_names]
         return sum(self._walk(t, x) for t in self.trees)
+
+    @property
+    def explainable(self) -> bool:
+        return bool(self.trees) and "internal_value" in self.trees[0]
+
+    def explain(self, features: Dict[str, float]) -> Dict:
+        """Why the model predicted what it did: walk each tree and credit every split's change in expected value to
+        the feature it split on (Saabas path attribution). base + sum(contributions) == predict(features)."""
+        x = [float(features.get(n, float("nan"))) for n in self.feature_names]
+        contrib = [0.0] * len(self.feature_names)
+        base = 0.0
+        for node in self.trees:
+            if "leaf_value" in node:
+                base += node["leaf_value"]
+                continue
+            base += node["internal_value"]
+            while "leaf_value" not in node:
+                v = x[node["split_feature"]]
+                missing = node.get("missing_type", "None")
+                is_nan = v != v
+                if missing == "NaN" and is_nan or missing == "Zero" and (is_nan or v == 0.0):
+                    go_left = node.get("default_left", True)
+                else:
+                    go_left = (0.0 if is_nan else v) <= node["threshold"]
+                child = node["left_child"] if go_left else node["right_child"]
+                child_val = child["leaf_value"] if "leaf_value" in child else child["internal_value"]
+                contrib[node["split_feature"]] += child_val - node["internal_value"]
+                node = child
+        return {"base": base, "contributions": dict(zip(self.feature_names, contrib))}

@@ -31,6 +31,9 @@ index_daily: Dict[str, Any] = {}
 # Latest AI agent status per user id (suggestion card on the Trade screen)
 ai_status: Dict[str, Dict[str, Any]] = {}
 
+# The model's score at every closed NIFTY minute today, for the admin AI Lab: {"day", "points": [...]}
+ai_score_log: Dict[str, Any] = {"day": None, "points": []}
+
 # Channel/key on which a closed NIFTY minute bar is published (drives the ML agent)
 MINUTE_BAR_KEY = "NIFTY_1M"
 

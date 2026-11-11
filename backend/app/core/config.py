@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     # Set false on a public server once your own account exists, so strangers cannot sign up
     ALLOW_REGISTRATION: bool = True
 
+    # Comma-separated emails that get admin pages (AI Lab: model training + live reasoning)
+    ADMIN_EMAILS: str = ""
+
     # Upstox market data (free with an Upstox account). Leave empty to use the price simulator.
     UPSTOX_API_KEY: str = ""
     UPSTOX_API_SECRET: str = ""
@@ -69,6 +72,10 @@ class Settings(BaseSettings):
     @property
     def cors_origins_list(self) -> List[str]:
         return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
+
+    @property
+    def admin_emails(self) -> List[str]:
+        return [e.strip().lower() for e in self.ADMIN_EMAILS.split(",") if e.strip()]
 
     @property
     def upstox_configured(self) -> bool:

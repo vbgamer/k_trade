@@ -261,6 +261,11 @@ class MarketDataService:
             candle = {**closed_index, "instrument_key": MINUTE_BAR_KEY,
                       "time": f"{today.isoformat()} {m // 60:02d}:{m % 60:02d}"}
             await memory_bus.publish(f"market:candles:{MINUTE_BAR_KEY}", json.dumps(candle))
+            try:  # the AI Lab's minute-by-minute score chart (runs whether or not anyone runs the AI agent)
+                from app.ml import live as ml_live
+                ml_live.record_minute(datetime.fromtimestamp(now, upstox_session.IST))
+            except Exception as e:
+                logger.debug(f"AI score log skipped: {e}")
 
     async def _broadcast_quotes(self, quotes: Dict[str, Dict[str, Any]], now: float):
         payload = {

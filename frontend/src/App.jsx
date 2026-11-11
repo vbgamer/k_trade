@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import CandleChart, { ChartModeToggle } from "./CandleChart";
 import Landing, { ThemeToggle } from "./Landing";
+import AILab from "./AILab";
 import { AppBackdrop } from "./MarketArt";
 
 /** A price that flashes green/red for a moment whenever it ticks up or down. */
@@ -990,6 +991,7 @@ export default function App() {
             { id: "dashboard", label: "📊 Live Dashboard", accent: "var(--color-cyan)" },
             { id: "trades", label: "📜 Past Trades & P&L", accent: "var(--color-secondary)" },
             { id: "broker", label: "🔑 Broker & Accounts", accent: "var(--color-green)" },
+            ...(userProfile?.is_admin ? [{ id: "ailab", label: "🧠 AI Lab", accent: "var(--color-amber)" }] : []),
           ].map((t) => (
             <button
               key={t.id}
@@ -1025,7 +1027,7 @@ export default function App() {
       </header>
 
       {/* Segments Selection Bar */}
-      {activeTab !== "home" && (
+      {activeTab !== "home" && activeTab !== "ailab" && (
       <section className="app-section" style={{ margin: "0 18px 16px 18px" }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
           <span style={{ fontSize: "0.78rem", color: "var(--color-text-muted)", fontWeight: "600", textTransform: "uppercase", letterSpacing: "1px" }}>
@@ -1738,6 +1740,8 @@ export default function App() {
 
           </div>
         )}
+
+        {activeTab === "ailab" && userProfile?.is_admin && <AILab apiBase={API_BASE} token={token} />}
 
         {/* ============================================================ */}
         {/* TAB 3: BROKER & TRADING ACCOUNT VAULT                        */}
