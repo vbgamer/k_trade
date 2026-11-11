@@ -238,3 +238,25 @@ def test_starting_a_strategy_stops_a_different_running_one(client, make_user):
     status = {s["subscription_id"]: s["status"] for s in client.get("/api/v1/subscriptions", headers=h).json()}
     assert status[ids[0]] == "stopped" and status[ids[1]] == "running"
     client.post(f"/api/v1/subscriptions/{ids[1]}/toggle", headers=h, json={"active": False})
+
+
+def test_market_candles_endpoint_returns_ist_minute_bars(client, make_user):
+    _, _, token = make_user()
+    h = {"Authorization": f"Bearer {token}"}
+    import time as _t
+    now = _t.time()
+    today, minute = mb.ist_minute(now)
+    mb._state["day"] = today
+    minute_bars["NSE_FO|CHART"] = [
+        {"minute": minute - 1, "open": 100.0, "high": 104.0, "low": 99.0, "close": 103.0},
+        {"minute": minute, "open": 103.0, "high": 103.5, "low": 102.0, "close": 102.5},
+    ]
+    res = client.get("/api/v1/market/candles", params={"instrument_key": "NSE_FO|CHART"}, headers=h)
+    assert res.status_code == 200
+    bars = res.json()["bars"]
+    assert [b["close"] for b in bars] == [103.0, 102.5]
+    # time is the IST wall-clock minute as a UTC epoch (what the chart displays)
+    t = datetime.utcfromtimestamp(bars[0]["time"])
+    assert (t.hour * 60 + t.minute) == minute - 1 and t.date() == today
+    assert client.get("/api/v1/market/candles", params={"instrument_key": "NSE_FO|NONE"}, headers=h).json()["bars"] == []
+    assert client.get("/api/v1/market/candles", params={"instrument_key": "X"}).status_code in (401, 403)

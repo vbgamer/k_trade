@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
+import CandleChart, { ChartModeToggle } from "./CandleChart";
 
 // Dev server (Vite) talks to the local backend; the production build is served by the backend itself.
 const API_BASE =
@@ -54,7 +55,6 @@ export default function App() {
   const [engineActive, setEngineActive] = useState(false);
   const [positions, setPositions] = useState([]);
   const [eventLogs, setEventLogs] = useState([]);
-  const [priceHistory, setPriceHistory] = useState([]);
   const [currentLtp, setCurrentLtp] = useState(150.0);
   const [currentStrike, setCurrentStrike] = useState("NIFTY26JUL24300CE");
 
@@ -82,6 +82,9 @@ export default function App() {
   const [quotes, setQuotes] = useState({});
   const [upstox, setUpstox] = useState({ configured: false, connected: false });
   const [ticket, setTicket] = useState(null); // { instrument_key, trading_symbol, side }
+  const readPref = (k, d) => { try { return localStorage.getItem(k) || d; } catch { return d; } };
+  const [chartMode, setChartModeState] = useState(() => readPref("chartMode", "candles"));
+  const setChartMode = (m) => { setChartModeState(m); try { localStorage.setItem("chartMode", m); } catch { /* private mode */ } };
   const [ticketLots, setTicketLots] = useState(1);
   const [ticketType, setTicketType] = useState("MARKET");
   const [ticketPrice, setTicketPrice] = useState("");
@@ -210,10 +213,6 @@ export default function App() {
           const ltp = data.ltp;
           setCurrentLtp(ltp);
           setCurrentStrike(atmRef.current.symbol);
-          setPriceHistory((prev) => {
-            const next = [...prev, ltp];
-            return next.slice(-40);
-          });
         } else {
           const time = new Date().toLocaleTimeString();
           addTerminalLog(event_type, JSON.stringify(data), time);
@@ -407,7 +406,6 @@ export default function App() {
           atmRef.current = { key: data.atm_ce_key, symbol };
           setCurrentStrike(symbol);
           setCurrentLtp(atmRow?.ce?.ltp ?? null);
-          setPriceHistory([]);
         }
       }
     } catch (err) {
@@ -707,22 +705,6 @@ export default function App() {
     } catch (err) {
       console.error(err);
     }
-  };
-
-  // Sparkline drawing helper
-  const drawSparkline = () => {
-    if (priceHistory.length < 2) return "";
-    const min = Math.min(...priceHistory);
-    const max = Math.max(...priceHistory);
-    const range = max - min || 1;
-    const height = 80;
-    const width = 450;
-    const points = priceHistory.map((val, idx) => {
-      const x = (idx / (priceHistory.length - 1)) * width;
-      const y = height - ((val - min) / range) * height + 5;
-      return `${x},${y}`;
-    });
-    return points.join(" ");
   };
 
   // --- RENDER AUTHENTICATION VIEW ---
@@ -1149,7 +1131,13 @@ export default function App() {
                   const pnl = ltp == null ? null : p.quantity * (ltp - p.average_price);
                   return (
                     <div key={p.instrument_key} className="position-row">
-                      <div style={{ minWidth: 0 }}>
+                      <div
+                        style={{ minWidth: 0, cursor: "pointer" }}
+                        role="button"
+                        tabIndex={0}
+                        title="Open chart"
+                        onClick={() => openTicket({ instrument_key: p.instrument_key, trading_symbol: p.trading_symbol }, p.quantity > 0 ? "SELL" : "BUY")}
+                      >
                         <div style={{ fontWeight: "600", fontSize: "0.88rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.trading_symbol}</div>
                         <div style={{ fontSize: "0.75rem", color: "var(--color-text-muted)" }}>
                           {p.quantity > 0 ? "LONG" : "SHORT"} {Math.abs(p.quantity)} · Avg {fmt(p.average_price)} · LTP {fmt(ltp)}
@@ -1406,26 +1394,21 @@ export default function App() {
               {/* Sparkline Price chart */}
               <div className="glass-panel" style={{ padding: "20px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
-                  <h4 style={{ color: "var(--color-text-muted)", fontSize: "0.85rem" }}>
-                    Real-time Option Contract Tick Sparkline ({currentStrike})
+                  <h4 style={{ color: "var(--color-text-muted)", fontSize: "0.85rem", margin: 0, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {currentStrike || "ATM Call"} · 1 min
                   </h4>
-                  <span style={{ fontSize: "0.78rem", color: "var(--color-cyan)" }}>
-                    LTP: ₹{fmt(currentLtp)}
-                  </span>
+                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                    <span style={{ fontSize: "0.78rem", color: "var(--color-cyan)" }}>
+                      LTP: ₹{fmt(currentLtp)}
+                    </span>
+                    <ChartModeToggle mode={chartMode} onChange={setChartMode} />
+                  </div>
                 </div>
-                <div style={{ background: "rgba(0,0,0,0.45)", borderRadius: "8px", padding: "10px", display: "flex", justifyContent: "center", overflow: "hidden" }}>
-                  {priceHistory.length > 1 ? (
-                    <svg width="450" height="90" style={{ overflow: "visible" }}>
-                      <polyline
-                        fill="none"
-                        stroke="var(--color-cyan)"
-                        strokeWidth="2.5"
-                        points={drawSparkline()}
-                        style={{ filter: "drop-shadow(0 0 5px rgba(6, 182, 212, 0.5))" }}
-                      />
-                    </svg>
+                <div style={{ background: "rgba(0,0,0,0.45)", borderRadius: "8px", padding: "6px", overflow: "hidden" }}>
+                  {atmRef.current.key ? (
+                    <CandleChart apiBase={API_BASE} token={token} instrumentKey={atmRef.current.key} mode={chartMode} height={240} liveLtp={liveQuote(atmRef.current.key).ltp ?? currentLtp} />
                   ) : (
-                    <p style={{ color: "var(--color-text-muted)", fontSize: "0.85rem", padding: "25px" }}>Streaming ticks over WebSocket...</p>
+                    <p style={{ color: "var(--color-text-muted)", fontSize: "0.85rem", padding: "25px", textAlign: "center" }}>Waiting for the option chain…</p>
                   )}
                 </div>
               </div>
@@ -1807,7 +1790,14 @@ export default function App() {
                     LTP {fmt(q.ltp)} · Bid {fmt(q.bid)} · Ask {fmt(q.ask)}
                   </div>
                 </div>
-                <button className="link-btn" onClick={() => setTicket(null)} aria-label="Close">✕</button>
+                <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                  <ChartModeToggle mode={chartMode} onChange={setChartMode} />
+                  <button className="link-btn" onClick={() => setTicket(null)} aria-label="Close">✕</button>
+                </div>
+              </div>
+
+              <div className="sheet-chart">
+                <CandleChart apiBase={API_BASE} token={token} instrumentKey={ticket.instrument_key} mode={chartMode} height={200} liveLtp={q.ltp ?? null} />
               </div>
 
               <div className="seg-toggle">

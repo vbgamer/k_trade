@@ -790,6 +790,47 @@ async def get_market_snapshot(user_id: str = Depends(get_current_user_id)):
     """Option chain window around ATM with live prices; refreshed by the market data loop."""
     return market_snapshot
 
+_candle_backfill_at: Dict[str, float] = {}
+
+@app.get("/api/v1/market/candles")
+async def get_market_candles(instrument_key: str, user_id: str = Depends(get_current_user_id)):
+    """Today's 1-minute candles for one instrument (the last one may still be forming).
+
+    Bars are built live from quotes; missing minutes (server started late, or the contract was outside the
+    quoted ATM window for a while) are filled from Upstox intraday candles, throttled per instrument. `time` is the IST wall-clock minute expressed as a
+    UTC epoch, so charts that render UTC show Indian market time.
+    """
+    import time as _time
+    from datetime import timezone
+    from app.core.memory_bus import minute_bars
+    from app.engine import minute_bars as mb
+
+    now = _time.time()
+    bars = minute_bars.get(instrument_key, [])
+    session_open = 9 * 60 + 15
+    today, minute_now = mb.ist_minute(now)
+    if (market_snapshot.get("source") == "upstox" and upstox_session.is_connected()
+            and minute_now > session_open + 1
+            # late start or holes (a contract is only quoted live while it sits near the ATM strike)
+            and len(bars) < min(minute_now, 15 * 60 + 30) - session_open - 1
+            and now - _candle_backfill_at.get(instrument_key, 0) > 120):
+        _candle_backfill_at[instrument_key] = now
+        try:
+            from app.broker.upstox import UpstoxClient
+            hist = await UpstoxClient(upstox_session.session["token"]).get_intraday_candles(instrument_key)
+            mb.backfill(instrument_key, [c for c in hist if c["date"] == today], now)
+            bars = minute_bars.get(instrument_key, [])
+        except Exception as e:
+            logger.warning(f"Candle backfill failed for {instrument_key}: {e}")
+
+    day0 = int(datetime.datetime(today.year, today.month, today.day, tzinfo=timezone.utc).timestamp())
+    return {
+        "instrument_key": instrument_key,
+        "source": market_snapshot.get("source"),
+        "bars": [{"time": day0 + b["minute"] * 60, "open": b["open"], "high": b["high"],
+                  "low": b["low"], "close": b["close"]} for b in bars],
+    }
+
 @app.get("/api/v1/ai/status")
 async def get_ai_status(user_id: str = Depends(get_current_user_id)):
     """The AI agent's latest view for this user, plus how the deployed model did in its backtest."""
