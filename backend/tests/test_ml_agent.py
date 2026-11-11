@@ -260,3 +260,16 @@ def test_market_candles_endpoint_returns_ist_minute_bars(client, make_user):
     assert (t.hour * 60 + t.minute) == minute - 1 and t.date() == today
     assert client.get("/api/v1/market/candles", params={"instrument_key": "NSE_FO|NONE"}, headers=h).json()["bars"] == []
     assert client.get("/api/v1/market/candles", params={"instrument_key": "X"}).status_code in (401, 403)
+
+
+def test_backfilled_bars_are_json_safe_when_they_close():
+    """Upstox candles carry datetime fields; a backfilled bar closing must still publish as JSON."""
+    import json as _json
+    minute_bars.clear()
+    mb._state["day"] = None
+    now = _ist(11, 55, 1).timestamp()
+    hist = [{"ts": _ist(11, 54), "date": DAY, "minute": 714, "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5}]
+    assert mb.backfill("K", hist, now) == 1
+    closed = mb.update("K", 1.6, now)
+    assert closed["minute"] == 714
+    _json.dumps(closed)  # must not raise

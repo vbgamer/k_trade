@@ -56,7 +56,9 @@ def backfill(key: str, candles: List[Dict[str, Any]], now_epoch: float) -> int:
     today, minute = ist_minute(now_epoch)
     reset_if_new_day(today)
     have = {b["minute"] for b in minute_bars.get(key, [])}
-    extra = [c for c in candles if c["minute"] < minute and c["minute"] not in have]
+    # keep only bar fields: API candles also carry datetime objects, which must never reach JSON publishing
+    extra = [{k: c[k] for k in ("minute", "open", "high", "low", "close")}
+             for c in candles if c["minute"] < minute and c["minute"] not in have]
     if extra:
         minute_bars[key] = sorted(minute_bars.get(key, []) + extra, key=lambda b: b["minute"])[-MAX_BARS:]
     return len(extra)
