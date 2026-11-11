@@ -62,3 +62,9 @@ class MemoryPubSub:
                 logger.error(f"Error distributing in-memory event: {str(e)}")
 
 memory_bus = MemoryPubSub()
+
+
+async def publish_user_event(user_id: str, event_type: str, data: Dict[str, Any]) -> None:
+    """Push an event to every open device of one user (fills, rejections, AI status)."""
+    await memory_bus.publish("user:events", json.dumps(
+        {"user_id": user_id, "event_type": event_type, "data": data}, default=str))

@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import BrokerOrder, Trade, StrategySubscription, User, Position
 from app.broker.mock_live_adapter import MockLiveAdapter
 from app.engine.rms import RMSService
-from app.core.memory_bus import tracked_keys
+from app.core.memory_bus import publish_user_event, tracked_keys
 from app.services.audit import log_audit
 from app.services.portfolio import update_position
 
@@ -105,6 +105,8 @@ class ExecutionService:
                     "realized_pnl_today": day_stats.realized_pnl_today,
                 }
             )
+            await publish_user_event(user_id, "OrderRejected", {
+                "trading_symbol": symbol, "side": side, "quantity": quantity, "reason": reason})
             return {"ok": False, "status": "REJECTED", "rejection_reason": reason}
 
         # Determine trading segment
@@ -204,6 +206,10 @@ class ExecutionService:
                     metadata_json={"fill_price": fill_price, "slippage": slippage, "broker_ref": broker_order_id}
                 )
                 
+                await publish_user_event(user_id, "OrderFilled", {
+                    "trading_symbol": symbol, "instrument_key": instrument_key, "side": side,
+                    "quantity": quantity, "fill_price": fill_price, "segment": segment,
+                    "realized_pnl": trade_realized})
                 return {
                     "ok": True,
                     "status": "FILLED",
@@ -225,6 +231,8 @@ class ExecutionService:
                     metadata_json={"rejection_reason": reason}
                 )
                 
+                await publish_user_event(user_id, "OrderRejected", {
+                    "trading_symbol": symbol, "side": side, "quantity": quantity, "reason": reason})
                 return {
                     "ok": False,
                     "status": "REJECTED",

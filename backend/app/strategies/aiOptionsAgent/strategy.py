@@ -10,13 +10,14 @@ be retrained on its own trades (the reward feedback loop).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 from app.core.memory_bus import (
-    MINUTE_BAR_KEY, ai_status, chain_history, in_memory_quotes, index_daily, market_snapshot, minute_bars,
+    MINUTE_BAR_KEY, ai_status, chain_history, publish_user_event, in_memory_quotes, index_daily, market_snapshot, minute_bars,
 )
 from app.engine import minute_bars as mb
 from app.engine.registry import BaseStrategy, StrategyRegistry
@@ -25,6 +26,7 @@ from app.services.upstox_session import IST
 
 logger = logging.getLogger("strategy_ai_agent")
 INDEX_KEY = "NSE_INDEX|Nifty 50"
+_pending: set = set()  # keeps fire-and-forget publish tasks alive
 
 
 class AIOptionsAgent(BaseStrategy):
@@ -44,8 +46,16 @@ class AIOptionsAgent(BaseStrategy):
         self.clock = lambda: datetime.now(IST)  # injectable for tests
 
     def _publish(self, **state):
-        ai_status[self.parameters.get("user_id") or "unknown"] = {"updated_at": time.time(), "mode": self.mode, "threshold": self.threshold,
+        user_id = self.parameters.get("user_id") or "unknown"
+        ai_status[user_id] = {"updated_at": time.time(), "mode": self.mode, "threshold": self.threshold,
                                  "trades_today": self.trades_today, "max_trades": self.max_trades, **state}
+        try:  # push to every open device so phone and laptop show the same card instantly
+            task = asyncio.get_running_loop().create_task(
+                publish_user_event(user_id, "AIStatus", ai_status[user_id]))
+            _pending.add(task)
+            task.add_done_callback(_pending.discard)
+        except RuntimeError:
+            pass  # no running loop (unit tests calling synchronously)
 
     async def on_candle(self, candle_data: Dict[str, Any], open_positions: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if candle_data.get("instrument_key") != MINUTE_BAR_KEY:

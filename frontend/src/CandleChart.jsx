@@ -1,13 +1,25 @@
 import { useEffect, useRef, useState } from "react";
 import { createChart, CrosshairMode } from "lightweight-charts";
 
-const COLORS = {
-  up: "#10b981",
-  down: "#ef4444",
-  line: "#06b6d4",
-  text: "#9ca3af",
-  grid: "rgba(255,255,255,0.05)",
-  border: "rgba(255,255,255,0.12)",
+// Read colours from the active theme's CSS tokens so charts follow day/night mode
+const readColors = () => {
+  const css = getComputedStyle(document.documentElement);
+  const v = (name, fallback) => css.getPropertyValue(name).trim() || fallback;
+  return {
+    up: v("--color-green", "#10b981"),
+    down: v("--color-red", "#ef4444"),
+    line: v("--color-cyan", "#06b6d4"),
+    text: v("--color-text-muted", "#9ca3af"),
+    grid: v("--line", "rgba(255,255,255,0.05)"),
+    border: v("--line-strong", "rgba(255,255,255,0.12)"),
+  };
+};
+
+const withAlpha = (hex, a) => {
+  const m = /^#([0-9a-f]{6})$/i.exec(hex);
+  if (!m) return hex;
+  const n = parseInt(m[1], 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
 };
 
 const IST_OFFSET_SEC = 19800;
@@ -59,7 +71,7 @@ export function ChartModeToggle({ mode, onChange }) {
  * Today's 1-minute chart for one instrument. Loads bars from the API, refreshes every 15s and moves the
  * last bar with every live price (liveLtp) so it ticks in real time between refreshes.
  */
-export default function CandleChart({ apiBase, token, instrumentKey, mode = "candles", height = 220, liveLtp = null }) {
+export default function CandleChart({ apiBase, token, instrumentKey, mode = "candles", height = 220, liveLtp = null, theme = "dark" }) {
   const containerRef = useRef(null);
   const chartRef = useRef(null);
   const seriesRef = useRef(null);
@@ -74,10 +86,8 @@ export default function CandleChart({ apiBase, token, instrumentKey, mode = "can
   useEffect(() => {
     const chart = createChart(containerRef.current, {
       autoSize: true,
-      layout: { background: { color: "transparent" }, textColor: COLORS.text, fontSize: 11 },
-      grid: { vertLines: { color: COLORS.grid }, horzLines: { color: COLORS.grid } },
-      rightPriceScale: { borderColor: COLORS.border },
-      timeScale: { borderColor: COLORS.border, timeVisible: true, secondsVisible: false, rightOffset: 3 },
+      layout: { background: { color: "transparent" }, fontSize: 11 },
+      timeScale: { timeVisible: true, secondsVisible: false, rightOffset: 3 },
       crosshair: { mode: CrosshairMode.Normal },
       handleScale: { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
     });
@@ -89,29 +99,36 @@ export default function CandleChart({ apiBase, token, instrumentKey, mode = "can
     };
   }, []);
 
-  // (Re)create the series when the chart type changes
+  // (Re)create the series when the chart type or theme changes
   useEffect(() => {
     const chart = chartRef.current;
     if (!chart) return;
+    const c = readColors();
+    chart.applyOptions({
+      layout: { textColor: c.text },
+      grid: { vertLines: { color: c.grid }, horzLines: { color: c.grid } },
+      rightPriceScale: { borderColor: c.border },
+      timeScale: { borderColor: c.border },
+    });
     if (seriesRef.current) chart.removeSeries(seriesRef.current);
     seriesRef.current =
       mode === "line"
         ? chart.addAreaSeries({
-            lineColor: COLORS.line,
-            topColor: "rgba(6,182,212,0.28)",
-            bottomColor: "rgba(6,182,212,0.02)",
+            lineColor: c.line,
+            topColor: withAlpha(c.line, 0.28),
+            bottomColor: withAlpha(c.line, 0.02),
             lineWidth: 2,
             priceLineVisible: true,
           })
         : chart.addCandlestickSeries({
-            upColor: COLORS.up,
-            downColor: COLORS.down,
-            wickUpColor: COLORS.up,
-            wickDownColor: COLORS.down,
+            upColor: c.up,
+            downColor: c.down,
+            wickUpColor: c.up,
+            wickDownColor: c.down,
             borderVisible: false,
           });
     if (barsRef.current.length) seriesRef.current.setData(toSeriesData(barsRef.current));
-  }, [mode]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [mode, theme]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Load + refresh bars for the instrument
   useEffect(() => {

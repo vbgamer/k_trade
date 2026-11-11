@@ -215,3 +215,18 @@ def test_starting_a_strategy_stops_older_running_copies(client, make_user, monke
 
     runs = {s["subscription_id"]: s["status"] for s in client.get("/api/v1/subscriptions", headers=auth(token)).json()}
     assert runs == {first: "stopped", second: "running"}
+
+
+def test_fill_reaches_every_device_of_the_user(client, make_user):
+    """Laptop and phone signed into the same account both get the fill, plus heartbeat pongs."""
+    _, _, token = make_user()
+    url = f"/api/v1/ws/stream?token={token}"
+    with client.websocket_connect(url) as laptop, client.websocket_connect(url) as phone:
+        res = client.post("/api/v1/paper-trading/execute-demo-trade", headers=auth(token),
+                          json={"side": "BUY", "quantity": 50})
+        assert res.status_code == 200
+        for ws in (laptop, phone):
+            msg = _next_non_tick(ws)
+            assert msg["event_type"] == "OrderFilled" and msg["data"]["side"] == "BUY"
+        phone.send_text("ping")
+        assert _next_non_tick(phone)["event_type"] == "Pong"

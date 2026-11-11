@@ -1,5 +1,26 @@
 import React, { useState, useEffect, useRef } from "react";
 import CandleChart, { ChartModeToggle } from "./CandleChart";
+import Landing, { ThemeToggle } from "./Landing";
+import { AppBackdrop } from "./MarketArt";
+
+/** A price that flashes green/red for a moment whenever it ticks up or down. */
+function FlashPrice({ value, text }) {
+  const prev = useRef(value);
+  const [dir, setDir] = useState(null);
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (value != null && prev.current != null && value !== prev.current) {
+      setDir(value > prev.current ? "up" : "down");
+      setTick((t) => t + 1);
+    }
+    prev.current = value;
+  }, [value]);
+  return (
+    <span key={tick} className={`price ${dir ? `flash-${dir}` : ""}`} style={{ borderRadius: "4px", padding: "0 3px", margin: "0 -3px" }}>
+      {text}
+    </span>
+  );
+}
 
 // Dev server (Vite) talks to the local backend; the production build is served by the backend itself.
 const API_BASE =
@@ -30,6 +51,8 @@ export default function App() {
 
   // Navigation tab: trade | dashboard | trades | broker
   const [activeTab, setActiveTab] = useState("trade");
+  const [theme, setTheme] = useState(() => document.documentElement.getAttribute("data-theme") || "dark");
+  const [overview, setOverview] = useState(null); // public landing data: ticker + AI model results
 
   // Segment Selection (Active: Intraday & F&O; Upcoming: Delivery, Commodity, Currency, Crypto)
   const [selectedSegment, setSelectedSegment] = useState("fno"); // "fno" | "intraday"
@@ -96,6 +119,10 @@ export default function App() {
 
   // WebSocket & Terminal
   const ws = useRef(null);
+  const heartbeatRef = useRef(null);
+  const reconnectRef = useRef(null);
+  const lastMsgRef = useRef(Date.now());
+  const [live, setLive] = useState(false);
   const sourceRef = useRef("simulator");
   const atmRef = useRef({ key: null, symbol: "" }); // current ATM call, for the dashboard sparkline
   const terminalEndRef = useRef(null);
@@ -130,12 +157,58 @@ export default function App() {
     if (match) setSelectedStrategy(match);
   }, [runningVersionId, strategies]);
 
+  // Day / night theme: applied to <html data-theme>, remembered per device
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    try { localStorage.setItem("theme", theme); } catch { /* private mode */ }
+    document.querySelector('meta[name="theme-color"]')?.setAttribute("content", theme === "light" ? "#f4f5fb" : "#07040f");
+  }, [theme]);
+  const toggleTheme = () => setTheme((t) => (t === "light" ? "dark" : "light"));
+
+  // Landing page data (public, no login), refreshed while the landing/home page is visible
+  useEffect(() => {
+    if (token && activeTab !== "home") return;
+    const load = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/v1/public/overview`);
+        if (res.ok) setOverview(await res.json());
+      } catch { /* offline: landing still renders */ }
+    };
+    load();
+    const id = setInterval(load, 15000);
+    return () => clearInterval(id);
+  }, [token, activeTab]);
+
   // Refetch trades when filters change
   useEffect(() => {
     if (token && activeTab === "trades") {
       fetchTrades();
     }
   }, [tradeFilterSegment, tradeFilterSide, activeTab]);
+
+  // Coming back to the app (phone unlocked, tab switched): reconnect if needed and pull fresh state.
+  // A light 15s refresh of positions/P&L also covers anything a dropped event would have missed.
+  useEffect(() => {
+    if (!token) return;
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      if (!ws.current || ws.current.readyState !== WebSocket.OPEN) connectWebSocket();
+      else resyncAll();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("online", onVisible);
+    const id = setInterval(() => {
+      if (document.visibilityState === "visible") {
+        fetchPositions();
+        fetchPortfolioSummary();
+      }
+    }, 15000);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("online", onVisible);
+      clearInterval(id);
+    };
+  }, [token]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Option chain structure (strikes/contracts) refreshes every 30s; prices stream in via QuoteUpdate
   useEffect(() => {
@@ -171,6 +244,8 @@ export default function App() {
   // --- WEBSOCKET CONNECTION ---
   // Close without triggering the auto-reconnect in onclose
   const closeWebSocket = () => {
+    clearInterval(heartbeatRef.current);
+    clearTimeout(reconnectRef.current);
     if (ws.current) {
       ws.current.onclose = null;
       ws.current.close();
@@ -178,21 +253,52 @@ export default function App() {
     }
   };
 
+  // Pull everything fresh (after a reconnect or when the app comes back to the foreground)
+  const resyncAll = () => {
+    fetchPositions();
+    fetchPortfolioSummary();
+    fetchUserProfile();
+    fetchSnapshot();
+    fetchAiStatus();
+    fetchRunningStrategy();
+    fetchTrades();
+  };
+
   const connectWebSocket = () => {
     closeWebSocket();
 
     // Browsers can't send an Authorization header on WebSocket upgrades, so the JWT goes in the query string
     const wsUrl = `${WS_BASE}/api/v1/ws/stream?token=${encodeURIComponent(token)}`;
-    ws.current = new WebSocket(wsUrl);
+    const socket = new WebSocket(wsUrl);
+    ws.current = socket;
+    lastMsgRef.current = Date.now();
 
-    ws.current.onopen = () => {
+    socket.onopen = () => {
+      setLive(true);
       addTerminalLog("System", "WebSocket connection active: Real-time Event Bus streaming.");
+      resyncAll(); // anything that happened while disconnected
+      // Heartbeat: phones silently drop sockets while asleep; no traffic for 45s means reconnect now
+      clearInterval(heartbeatRef.current);
+      heartbeatRef.current = setInterval(() => {
+        if (socket.readyState !== WebSocket.OPEN) return;
+        if (Date.now() - lastMsgRef.current > 45000) {
+          socket.close();
+          return;
+        }
+        socket.send("ping");
+      }, 20000);
     };
 
-    ws.current.onmessage = (event) => {
+    socket.onmessage = (event) => {
+      lastMsgRef.current = Date.now();
       try {
         const payload = JSON.parse(event.data);
         const { event_type, data } = payload;
+        if (event_type === "Pong") return;
+        if (event_type === "AIStatus") {
+          setAiInfo((prev) => ({ ...(prev || {}), status: data }));
+          return;
+        }
 
         if (event_type === "QuoteUpdate") {
           setQuotes((prev) => ({ ...prev, ...data.quotes }));
@@ -207,27 +313,28 @@ export default function App() {
               ? { ...prev, source: data.source, spot: data.spot, rows: [] }
               : { ...prev, spot: data.spot ?? prev.spot }
           );
-        } else if (event_type === "TickUpdate") {
-          // Candles arrive for every quoted instrument (index + whole chain); chart only the ATM call
-          if (!atmRef.current.key || data.instrument_key !== atmRef.current.key) return;
-          const ltp = data.ltp;
-          setCurrentLtp(ltp);
-          setCurrentStrike(atmRef.current.symbol);
         } else {
           const time = new Date().toLocaleTimeString();
           addTerminalLog(event_type, JSON.stringify(data), time);
 
           if (event_type === "StrategyStarted") {
             setEngineActive(true);
+            fetchRunningStrategy();
           } else if (event_type === "StrategyStopped" || event_type === "RiskTriggered") {
             setEngineActive(false);
+            fetchRunningStrategy();
             fetchPositions();
             fetchPortfolioSummary();
-          } else if (event_type === "OrderFilled") {
+          } else if (event_type === "OrderFilled" || event_type === "OrderRejected") {
             fetchPositions();
             fetchPortfolioSummary();
             fetchTrades();
             fetchUserProfile();
+            if (event_type === "OrderFilled") {
+              showToast(true, `${data.side} ${data.quantity} ${data.trading_symbol} filled @ ₹${Number(data.fill_price).toFixed(2)}`);
+            } else {
+              showToast(false, `${data.side} ${data.trading_symbol} rejected: ${data.reason}`);
+            }
           }
         }
       } catch (err) {
@@ -235,13 +342,16 @@ export default function App() {
       }
     };
 
-    ws.current.onclose = (event) => {
+    socket.onclose = (event) => {
+      clearInterval(heartbeatRef.current);
+      setLive(false);
       if (event.code === 1008) {
         // Server rejected the token (expired or invalid): sign out
         setToken(null);
         return;
       }
-      setTimeout(connectWebSocket, 5000);
+      clearTimeout(reconnectRef.current);
+      reconnectRef.current = setTimeout(connectWebSocket, 2000);
     };
   };
 
@@ -426,6 +536,7 @@ export default function App() {
     n == null || Number.isNaN(Number(n)) ? "–" : Number(n).toLocaleString("en-IN", { minimumFractionDigits: digits, maximumFractionDigits: digits });
 
   const lotSize = marketSnap.lot_size || 1;
+  const atmLtp = (atmRef.current.key && liveQuote(atmRef.current.key).ltp) ?? currentLtp; // streams every 2s
   const openPositionsAll = positions.filter((p) => p.quantity !== 0);
 
   const openTicket = (leg, side) => {
@@ -709,15 +820,14 @@ export default function App() {
 
   // --- RENDER AUTHENTICATION VIEW ---
   if (!token) {
-    return (
-      <div style={{ display: "flex", justifyContent: "center", alignItems: "center", minHeight: "100vh", padding: "20px" }}>
-        <div className="glass-panel" style={{ width: "100%", maxWidth: "460px", padding: "40px 32px" }}>
+    const authCard = (
+        <div className="glass-panel auth-card">
           <div style={{ textAlign: "center", marginBottom: "28px" }}>
             <div style={{ display: "inline-flex", alignItems: "center", gap: "8px", marginBottom: "8px" }}>
               <span style={{ width: "10px", height: "10px", borderRadius: "50%", background: "var(--color-green)", boxShadow: "var(--shadow-neon-green)" }}></span>
               <span style={{ fontSize: "0.8rem", color: "var(--color-green)", fontWeight: "600", letterSpacing: "1px" }}>ALGO TRADING ENGINE</span>
             </div>
-            <h1 style={{ fontSize: "1.9rem", fontWeight: "800", color: "#fff" }}>
+            <h1 style={{ fontSize: "1.9rem", fontWeight: "800", color: "var(--color-text-main)" }}>
               <span style={{ color: "var(--color-primary)", textShadow: "var(--shadow-neon-purple)" }}>ALGOTRADE</span> PRO
             </h1>
             <p style={{ color: "var(--color-text-muted)", fontSize: "0.88rem", marginTop: "6px" }}>
@@ -736,7 +846,7 @@ export default function App() {
                   required
                   value={firstName}
                   onChange={(e) => setFirstName(e.target.value)}
-                  style={{ width: "50%", padding: "12px", border: "1px solid var(--border-glow)", background: "rgba(0,0,0,0.4)", color: "#fff", borderRadius: "8px" }}
+                  style={{ width: "50%", padding: "12px", border: "1px solid var(--border-glow)", background: "var(--bg-inset)", color: "var(--color-text-main)", borderRadius: "8px" }}
                 />
                 <input
                   type="text"
@@ -744,7 +854,7 @@ export default function App() {
                   required
                   value={lastName}
                   onChange={(e) => setLastName(e.target.value)}
-                  style={{ width: "50%", padding: "12px", border: "1px solid var(--border-glow)", background: "rgba(0,0,0,0.4)", color: "#fff", borderRadius: "8px" }}
+                  style={{ width: "50%", padding: "12px", border: "1px solid var(--border-glow)", background: "var(--bg-inset)", color: "var(--color-text-main)", borderRadius: "8px" }}
                 />
               </div>
             )}
@@ -755,7 +865,7 @@ export default function App() {
               required
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              style={{ width: "100%", padding: "12px", border: "1px solid var(--border-glow)", background: "rgba(0,0,0,0.4)", color: "#fff", borderRadius: "8px" }}
+              style={{ width: "100%", padding: "12px", border: "1px solid var(--border-glow)", background: "var(--bg-inset)", color: "var(--color-text-main)", borderRadius: "8px" }}
             />
 
             <input
@@ -764,12 +874,12 @@ export default function App() {
               required
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              style={{ width: "100%", padding: "12px", border: "1px solid var(--border-glow)", background: "rgba(0,0,0,0.4)", color: "#fff", borderRadius: "8px" }}
+              style={{ width: "100%", padding: "12px", border: "1px solid var(--border-glow)", background: "var(--bg-inset)", color: "var(--color-text-main)", borderRadius: "8px" }}
             />
 
             {authMode === "register" && (
               <div style={{ padding: "12px", borderRadius: "8px", background: "rgba(139, 92, 246, 0.1)", border: "1px solid rgba(139, 92, 246, 0.25)", fontSize: "0.8rem", color: "var(--color-secondary)" }}>
-                ⚡ Auto-configured: <strong>Paper Trading Simulator</strong> loaded with <strong>₹5,00,000 Virtual Margin</strong> and pre-seeded Intraday & F&O past trade history.
+                ⚡ Every new account starts with <strong>₹5,00,000 of virtual capital</strong> for paper trading. No real money is ever used.
               </div>
             )}
 
@@ -778,7 +888,7 @@ export default function App() {
 
             <button
               type="submit"
-              style={{ padding: "13px", borderRadius: "8px", border: "none", cursor: "pointer", background: "var(--color-primary)", color: "#fff", fontSize: "1rem", fontWeight: "600", boxShadow: "var(--shadow-neon-purple)", marginTop: "4px" }}
+              style={{ padding: "13px", borderRadius: "8px", border: "none", cursor: "pointer", background: "var(--color-primary)", color: "var(--on-accent)", fontSize: "1rem", fontWeight: "600", boxShadow: "var(--shadow-neon-purple)", marginTop: "4px" }}
             >
               {authMode === "login" ? "Enter Algo Trading Platform" : "Create Account & Start Trading"}
             </button>
@@ -800,7 +910,27 @@ export default function App() {
             </span>
           </div>
         </div>
-      </div>
+    );
+    const getStarted = (mode) => {
+      setAuthMode(mode);
+      setErrorMsg("");
+      setSuccessMsg("");
+      document.getElementById("auth")?.scrollIntoView({ behavior: "smooth", block: "center" });
+      setTimeout(() => document.querySelector(".auth-card input")?.focus({ preventScroll: true }), 450);
+    };
+    return (
+      <>
+        <AppBackdrop />
+        <Landing
+          loggedIn={false}
+          authCard={authCard}
+          theme={theme}
+          onToggleTheme={toggleTheme}
+          onGetStarted={getStarted}
+          ticker={overview?.ticker}
+          aiModel={overview?.ai_model}
+        />
+      </>
     );
   }
 
@@ -810,16 +940,17 @@ export default function App() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", minHeight: "100vh" }}>
+      <AppBackdrop />
       {/* Top Application Header */}
       <header className="glass-panel app-header" style={{ margin: "14px 18px", borderRadius: "14px", display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 24px", flexWrap: "wrap", gap: "15px" }}>
         
         {/* Logo & Branding */}
         <div style={{ display: "flex", alignItems: "center", gap: "14px" }}>
-          <div style={{ width: "36px", height: "36px", borderRadius: "10px", background: "linear-gradient(135deg, #8b5cf6, #06b6d4)", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: "800", color: "#fff", fontSize: "1.1rem" }}>
+          <div style={{ width: "36px", height: "36px", borderRadius: "10px", background: "linear-gradient(135deg, #8b5cf6, #06b6d4)", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: "800", color: "var(--on-accent)", fontSize: "1.1rem" }}>
             AT
           </div>
           <div>
-            <h1 style={{ fontSize: "1.25rem", fontWeight: "800", color: "#fff", letterSpacing: "0.5px", margin: 0 }}>
+            <h1 style={{ fontSize: "1.25rem", fontWeight: "800", color: "var(--color-text-main)", letterSpacing: "0.5px", margin: 0 }}>
               <span style={{ color: "var(--color-primary)" }}>ALGOTRADE</span> PRO
             </h1>
             <span style={{ fontSize: "0.72rem", color: "var(--color-text-muted)", textTransform: "uppercase", letterSpacing: "1px" }}>
@@ -829,7 +960,7 @@ export default function App() {
         </div>
 
         {/* Paper Trading Account Badge */}
-        <div style={{ display: "flex", alignItems: "center", gap: "12px", background: "rgba(0,0,0,0.35)", padding: "6px 14px", borderRadius: "10px", border: "1px solid var(--border-glow)" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "12px", background: "var(--bg-inset)", padding: "6px 14px", borderRadius: "10px", border: "1px solid var(--border-glow)" }}>
           <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: "var(--color-green)", boxShadow: "var(--shadow-neon-green)" }} className="pulse-glow"></span>
           <div>
             <div style={{ fontSize: "0.75rem", color: "var(--color-cyan)", fontWeight: "600", display: "flex", alignItems: "center", gap: "6px" }}>
@@ -838,91 +969,46 @@ export default function App() {
                 {marketSnap.source === "upstox" ? "LIVE NSE" : "SIMULATED"}
               </span>
             </div>
-            <div style={{ fontSize: "0.82rem", color: "#fff", fontWeight: "700" }}>
+            <div style={{ fontSize: "0.82rem", color: "var(--color-text-main)", fontWeight: "700" }}>
               Margin: ₹{virtualMargin.toLocaleString("en-IN", { minimumFractionDigits: 2 })}
             </div>
           </div>
           <button
             onClick={handleResetCapital}
             title="Reset Virtual Margin to ₹5,00,000"
-            style={{ background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.15)", borderRadius: "6px", color: "var(--color-text-muted)", fontSize: "0.72rem", padding: "4px 8px", cursor: "pointer" }}
+            style={{ background: "var(--line)", border: "1px solid var(--line-strong)", borderRadius: "6px", color: "var(--color-text-muted)", fontSize: "0.72rem", padding: "4px 8px", cursor: "pointer" }}
           >
             Reset
           </button>
         </div>
 
         {/* Center Tabs Navigation */}
-        <nav className="app-nav" style={{ display: "flex", gap: "10px" }}>
-          <button
-            onClick={() => setActiveTab("trade")}
-            style={{
-              padding: "8px 16px",
-              borderRadius: "8px",
-              border: activeTab === "trade" ? "1px solid var(--color-cyan)" : "1px solid transparent",
-              background: activeTab === "trade" ? "rgba(6, 182, 212, 0.15)" : "transparent",
-              color: activeTab === "trade" ? "var(--color-cyan)" : "var(--color-text-muted)",
-              fontSize: "0.92rem",
-              fontWeight: "600",
-              cursor: "pointer",
-              transition: "all 0.2s"
-            }}
-          >
-            ⚡ Trade
-          </button>
-          <button
-            onClick={() => setActiveTab("dashboard")}
-            style={{
-              padding: "8px 16px",
-              borderRadius: "8px",
-              border: activeTab === "dashboard" ? "1px solid var(--color-cyan)" : "1px solid transparent",
-              background: activeTab === "dashboard" ? "rgba(6, 182, 212, 0.15)" : "transparent",
-              color: activeTab === "dashboard" ? "var(--color-cyan)" : "var(--color-text-muted)",
-              fontSize: "0.92rem",
-              fontWeight: "600",
-              cursor: "pointer",
-              transition: "all 0.2s"
-            }}
-          >
-            📊 Live Dashboard
-          </button>
-          <button
-            onClick={() => setActiveTab("trades")}
-            style={{
-              padding: "8px 16px",
-              borderRadius: "8px",
-              border: activeTab === "trades" ? "1px solid var(--color-primary)" : "1px solid transparent",
-              background: activeTab === "trades" ? "rgba(139, 92, 246, 0.15)" : "transparent",
-              color: activeTab === "trades" ? "var(--color-secondary)" : "var(--color-text-muted)",
-              fontSize: "0.92rem",
-              fontWeight: "600",
-              cursor: "pointer",
-              transition: "all 0.2s"
-            }}
-          >
-            📜 Past Trades & P&L
-          </button>
-          <button
-            onClick={() => setActiveTab("broker")}
-            style={{
-              padding: "8px 16px",
-              borderRadius: "8px",
-              border: activeTab === "broker" ? "1px solid var(--color-green)" : "1px solid transparent",
-              background: activeTab === "broker" ? "rgba(16, 185, 129, 0.15)" : "transparent",
-              color: activeTab === "broker" ? "var(--color-green)" : "var(--color-text-muted)",
-              fontSize: "0.92rem",
-              fontWeight: "600",
-              cursor: "pointer",
-              transition: "all 0.2s"
-            }}
-          >
-            🔑 Broker & Accounts
-          </button>
+        <nav className="app-nav">
+          {[
+            { id: "home", label: "🏠 Home", accent: "var(--color-primary)" },
+            { id: "trade", label: "⚡ Trade", accent: "var(--color-cyan)" },
+            { id: "dashboard", label: "📊 Live Dashboard", accent: "var(--color-cyan)" },
+            { id: "trades", label: "📜 Past Trades & P&L", accent: "var(--color-secondary)" },
+            { id: "broker", label: "🔑 Broker & Accounts", accent: "var(--color-green)" },
+          ].map((t) => (
+            <button
+              key={t.id}
+              className={`nav-tab ${activeTab === t.id ? "active" : ""}`}
+              style={{ "--tab-accent": t.accent }}
+              onClick={() => setActiveTab(t.id)}
+              aria-current={activeTab === t.id ? "page" : undefined}
+            >
+              {t.label}
+            </button>
+          ))}
         </nav>
 
         {/* User Info & Logout */}
         <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+          <span className={`sync-dot ${live ? "on" : ""}`} title={live ? "Live: in sync with your other devices" : "Reconnecting…"} />
+          <ThemeToggle theme={theme} onToggle={toggleTheme} />
           <div style={{ textAlign: "right" }}>
-            <div style={{ fontSize: "0.85rem", fontWeight: "600", color: "#fff" }}>
+            <div style={{ fontSize: "0.85rem", fontWeight: "600", color: "var(--color-text-main)" }}>
               {userProfile?.first_name || "Trader"} {userProfile?.last_name || ""}
             </div>
             <div style={{ fontSize: "0.72rem", color: "var(--color-text-muted)" }}>
@@ -931,7 +1017,7 @@ export default function App() {
           </div>
           <button
             onClick={() => setToken(null)}
-            style={{ padding: "8px 14px", borderRadius: "8px", border: "1px solid var(--border-glow)", background: "rgba(255,255,255,0.06)", color: "#fff", cursor: "pointer", fontSize: "0.85rem", fontWeight: "500" }}
+            style={{ padding: "8px 14px", borderRadius: "8px", border: "1px solid var(--border-glow)", background: "var(--line)", color: "var(--color-text-main)", cursor: "pointer", fontSize: "0.85rem", fontWeight: "500" }}
           >
             Logout
           </button>
@@ -939,6 +1025,7 @@ export default function App() {
       </header>
 
       {/* Segments Selection Bar */}
+      {activeTab !== "home" && (
       <section className="app-section" style={{ margin: "0 18px 16px 18px" }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
           <span style={{ fontSize: "0.78rem", color: "var(--color-text-muted)", fontWeight: "600", textTransform: "uppercase", letterSpacing: "1px" }}>
@@ -957,7 +1044,7 @@ export default function App() {
             className={`segment-card ${selectedSegment === "fno" ? "selected" : ""}`}
           >
             <div>
-              <div style={{ fontWeight: "700", color: "#fff", fontSize: "0.92rem" }}>F&O (Options)</div>
+              <div style={{ fontWeight: "700", color: "var(--color-text-main)", fontSize: "0.92rem" }}>F&O (Options)</div>
               <div style={{ fontSize: "0.75rem", color: "var(--color-text-muted)" }}>Nifty / BankNifty ATM</div>
             </div>
             <span className="badge-active">ACTIVE</span>
@@ -969,7 +1056,7 @@ export default function App() {
             className={`segment-card ${selectedSegment === "intraday" ? "selected" : ""}`}
           >
             <div>
-              <div style={{ fontWeight: "700", color: "#fff", fontSize: "0.92rem" }}>Intraday (MIS)</div>
+              <div style={{ fontWeight: "700", color: "var(--color-text-main)", fontSize: "0.92rem" }}>Intraday (MIS)</div>
               <div style={{ fontSize: "0.75rem", color: "var(--color-text-muted)" }}>Day Trading Auto-Squareoff</div>
             </div>
             <span className="badge-active">ACTIVE</span>
@@ -981,8 +1068,8 @@ export default function App() {
             className="segment-card locked"
           >
             <div>
-              <div style={{ fontWeight: "600", color: "#9ca3af", fontSize: "0.92rem" }}>Equity Delivery</div>
-              <div style={{ fontSize: "0.75rem", color: "#6b7280" }}>Cash CNC Swing Algo</div>
+              <div style={{ fontWeight: "600", color: "var(--color-text-muted)", fontSize: "0.92rem" }}>Equity Delivery</div>
+              <div style={{ fontSize: "0.75rem", color: "var(--color-text-faint)" }}>Cash CNC Swing Algo</div>
             </div>
             <span className="badge-upcoming shimmer-badge">UPCOMING SOON</span>
           </div>
@@ -993,8 +1080,8 @@ export default function App() {
             className="segment-card locked"
           >
             <div>
-              <div style={{ fontWeight: "600", color: "#9ca3af", fontSize: "0.92rem" }}>Commodities</div>
-              <div style={{ fontSize: "0.75rem", color: "#6b7280" }}>MCX Crude & Gold</div>
+              <div style={{ fontWeight: "600", color: "var(--color-text-muted)", fontSize: "0.92rem" }}>Commodities</div>
+              <div style={{ fontSize: "0.75rem", color: "var(--color-text-faint)" }}>MCX Crude & Gold</div>
             </div>
             <span className="badge-upcoming shimmer-badge">UPCOMING SOON</span>
           </div>
@@ -1005,8 +1092,8 @@ export default function App() {
             className="segment-card locked"
           >
             <div>
-              <div style={{ fontWeight: "600", color: "#9ca3af", fontSize: "0.92rem" }}>Currency (Forex)</div>
-              <div style={{ fontSize: "0.75rem", color: "#6b7280" }}>USDINR / EURINR</div>
+              <div style={{ fontWeight: "600", color: "var(--color-text-muted)", fontSize: "0.92rem" }}>Currency (Forex)</div>
+              <div style={{ fontSize: "0.75rem", color: "var(--color-text-faint)" }}>USDINR / EURINR</div>
             </div>
             <span className="badge-upcoming shimmer-badge">UPCOMING SOON</span>
           </div>
@@ -1017,8 +1104,8 @@ export default function App() {
             className="segment-card locked"
           >
             <div>
-              <div style={{ fontWeight: "600", color: "#9ca3af", fontSize: "0.92rem" }}>Crypto Futures</div>
-              <div style={{ fontSize: "0.75rem", color: "#6b7280" }}>BTC & ETH 24/7</div>
+              <div style={{ fontWeight: "600", color: "var(--color-text-muted)", fontSize: "0.92rem" }}>Crypto Futures</div>
+              <div style={{ fontSize: "0.75rem", color: "var(--color-text-faint)" }}>BTC & ETH 24/7</div>
             </div>
             <span className="badge-upcoming shimmer-badge">UPCOMING SOON</span>
           </div>
@@ -1026,8 +1113,28 @@ export default function App() {
         </div>
       </section>
 
+      )}
+
       {/* Main Containers */}
       <main className="app-main" style={{ flex: 1, padding: "0 18px 20px 18px" }}>
+        <div key={activeTab} className="tab-enter">
+        {activeTab === "home" && (
+          <Landing
+            loggedIn
+            theme={theme}
+            onToggleTheme={toggleTheme}
+            onOpenTab={setActiveTab}
+            ticker={{
+              source: marketSnap.source,
+              spot: marketSnap.spot,
+              prev_close: marketSnap.spot_prev_close,
+              expiry: marketSnap.expiry,
+              ...(overview?.ticker ? { atm_strike: overview.ticker.atm_strike, atm_ce: overview.ticker.atm_ce, atm_pe: overview.ticker.atm_pe } : {}),
+            }}
+            aiModel={aiInfo?.model || overview?.ai_model}
+            liveChart={<CandleChart apiBase={API_BASE} token={token} instrumentKey="NSE_INDEX|Nifty 50" mode={chartMode} height={130} liveLtp={marketSnap.spot ?? null} theme={theme} />}
+          />
+        )}
 
         {/* ============================================================ */}
         {/* TAB 0: TRADE (live option chain, order ticket, positions)    */}
@@ -1173,12 +1280,12 @@ export default function App() {
                   return (
                     <div key={row.strike} className={`chain-row ${isAtm ? "chain-atm" : ""}`}>
                       <button className={`price-btn ${itmCe ? "itm" : ""}`} disabled={!ce} onClick={() => ce && openTicket(ce, "BUY")}>
-                        <span className="price">{fmt(ce?.ltp)}</span>
+                        <FlashPrice value={ce?.ltp} text={fmt(ce?.ltp)} />
                         {ce?.delta != null && <span className="sub">Δ {fmt(ce.delta)}</span>}
                       </button>
                       <span className="strike">{row.strike}{isAtm && <small>ATM</small>}</span>
                       <button className={`price-btn right ${itmPe ? "itm" : ""}`} disabled={!pe} onClick={() => pe && openTicket(pe, "BUY")}>
-                        <span className="price">{fmt(pe?.ltp)}</span>
+                        <FlashPrice value={pe?.ltp} text={fmt(pe?.ltp)} />
                         {pe?.delta != null && <span className="sub">Δ {fmt(pe.delta)}</span>}
                       </button>
                     </div>
@@ -1200,7 +1307,7 @@ export default function App() {
               
               {/* Controls Card */}
               <div className="glass-panel" style={{ padding: "22px" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px", borderBottom: "1px solid rgba(255,255,255,0.08)", paddingBottom: "10px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px", borderBottom: "1px solid var(--line)", paddingBottom: "10px" }}>
                   <h3 style={{ color: "var(--color-secondary)", fontSize: "1.05rem", margin: 0 }}>
                     Strategy Parameters
                   </h3>
@@ -1218,7 +1325,7 @@ export default function App() {
                       value={selectedStrategy?.id || ""}
                       disabled={engineActive}
                       onChange={(e) => setSelectedStrategy(strategies.find((s) => s.id === e.target.value) || null)}
-                      style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "#110c1c", color: "#fff", border: "1px solid var(--border-glow)" }}
+                      style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "var(--bg-input)", color: "var(--color-text-main)", border: "1px solid var(--border-glow)" }}
                     >
                       {strategies.map((s) => (
                         <option key={s.id} value={s.id}>{s.name}</option>
@@ -1230,14 +1337,14 @@ export default function App() {
                     <div style={{ display: "flex", gap: "10px" }}>
                       <div style={{ width: "50%" }}>
                         <label style={{ fontSize: "0.82rem", color: "var(--color-text-muted)", display: "block", marginBottom: "5px" }}>AI Mode</label>
-                        <select value={aiMode} disabled={engineActive} onChange={(e) => setAiMode(e.target.value)} style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "#110c1c", color: "#fff", border: "1px solid var(--border-glow)" }}>
+                        <select value={aiMode} disabled={engineActive} onChange={(e) => setAiMode(e.target.value)} style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "var(--bg-input)", color: "var(--color-text-main)", border: "1px solid var(--border-glow)" }}>
                           <option value="auto">Auto trade</option>
                           <option value="suggest">Suggest only</option>
                         </select>
                       </div>
                       <div style={{ width: "50%" }}>
                         <label style={{ fontSize: "0.82rem", color: "var(--color-text-muted)", display: "block", marginBottom: "5px" }}>Max trades / day</label>
-                        <input type="number" min={1} max={10} value={aiMaxTrades} disabled={engineActive} onChange={(e) => setAiMaxTrades(Number(e.target.value))} style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "#110c1c", color: "#fff", border: "1px solid var(--border-glow)" }} />
+                        <input type="number" min={1} max={10} value={aiMaxTrades} disabled={engineActive} onChange={(e) => setAiMaxTrades(Number(e.target.value))} style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "var(--bg-input)", color: "var(--color-text-main)", border: "1px solid var(--border-glow)" }} />
                       </div>
                     </div>
                   )}
@@ -1245,7 +1352,7 @@ export default function App() {
                   <div style={{ display: "flex", gap: "10px" }}>
                     <div style={{ width: "50%" }}>
                       <label style={{ fontSize: "0.82rem", color: "var(--color-text-muted)", display: "block", marginBottom: "5px" }}>Candle Interval</label>
-                      <select value={timeframe} onChange={(e) => setTimeframe(Number(e.target.value))} style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "#110c1c", color: "#fff", border: "1px solid var(--border-glow)" }}>
+                      <select value={timeframe} onChange={(e) => setTimeframe(Number(e.target.value))} style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "var(--bg-input)", color: "var(--color-text-main)", border: "1px solid var(--border-glow)" }}>
                         <option value={1}>1 Minute</option>
                         <option value={3}>3 Minutes</option>
                         <option value={5}>5 Minutes</option>
@@ -1253,25 +1360,25 @@ export default function App() {
                     </div>
                     <div style={{ width: "50%" }}>
                       <label style={{ fontSize: "0.82rem", color: "var(--color-text-muted)", display: "block", marginBottom: "5px" }}>Lot Qty</label>
-                      <input type="number" value={qty} onChange={(e) => setQty(Number(e.target.value))} style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "#110c1c", color: "#fff", border: "1px solid var(--border-glow)" }} />
+                      <input type="number" value={qty} onChange={(e) => setQty(Number(e.target.value))} style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "var(--bg-input)", color: "var(--color-text-main)", border: "1px solid var(--border-glow)" }} />
                     </div>
                   </div>
 
                   <div style={{ display: "flex", gap: "10px" }}>
                     <div style={{ width: "50%" }}>
                       <label style={{ fontSize: "0.82rem", color: "var(--color-text-muted)", display: "block", marginBottom: "5px" }}>Target PnL (₹)</label>
-                      <input type="number" value={maxProfit} onChange={(e) => setMaxProfit(Number(e.target.value))} style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "#110c1c", color: "#fff", border: "1px solid var(--border-glow)" }} />
+                      <input type="number" value={maxProfit} onChange={(e) => setMaxProfit(Number(e.target.value))} style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "var(--bg-input)", color: "var(--color-text-main)", border: "1px solid var(--border-glow)" }} />
                     </div>
                     <div style={{ width: "50%" }}>
                       <label style={{ fontSize: "0.82rem", color: "var(--color-text-muted)", display: "block", marginBottom: "5px" }}>Max Stop Loss (₹)</label>
-                      <input type="number" value={maxLoss} onChange={(e) => setMaxLoss(Number(e.target.value))} style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "#110c1c", color: "#fff", border: "1px solid var(--border-glow)" }} />
+                      <input type="number" value={maxLoss} onChange={(e) => setMaxLoss(Number(e.target.value))} style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "var(--bg-input)", color: "var(--color-text-main)", border: "1px solid var(--border-glow)" }} />
                     </div>
                   </div>
 
                   <div style={{ display: "flex", gap: "10px" }}>
                     <div style={{ width: "50%" }}>
                       <label style={{ fontSize: "0.82rem", color: "var(--color-text-muted)", display: "block", marginBottom: "5px" }}>Product Code</label>
-                      <select value={productType} onChange={(e) => setProductType(e.target.value)} style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "#110c1c", color: "#fff", border: "1px solid var(--border-glow)" }}>
+                      <select value={productType} onChange={(e) => setProductType(e.target.value)} style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "var(--bg-input)", color: "var(--color-text-main)", border: "1px solid var(--border-glow)" }}>
                         <option value="MIS">MIS (Intraday)</option>
                         <option value="NRML">NRML (Overnight F&O)</option>
                       </select>
@@ -1289,14 +1396,14 @@ export default function App() {
                   {engineActive ? (
                     <button
                       onClick={handleStopStrategy}
-                      style={{ marginTop: "6px", padding: "14px", borderRadius: "8px", border: "none", cursor: "pointer", background: "var(--color-red)", color: "#fff", fontWeight: "700", fontSize: "0.95rem", boxShadow: "var(--shadow-neon-red)" }}
+                      style={{ marginTop: "6px", padding: "14px", borderRadius: "8px", border: "none", cursor: "pointer", background: "var(--color-red)", color: "var(--on-accent)", fontWeight: "700", fontSize: "0.95rem", boxShadow: "var(--shadow-neon-red)" }}
                     >
                       HALT ENGINE RUNNER
                     </button>
                   ) : (
                     <button
                       onClick={handleStartStrategy}
-                      style={{ marginTop: "6px", padding: "14px", borderRadius: "8px", border: "none", cursor: "pointer", background: "var(--color-cyan)", color: "#fff", fontWeight: "700", fontSize: "0.95rem", boxShadow: "var(--shadow-neon-cyan)" }}
+                      style={{ marginTop: "6px", padding: "14px", borderRadius: "8px", border: "none", cursor: "pointer", background: "var(--color-cyan)", color: "var(--on-accent)", fontWeight: "700", fontSize: "0.95rem", boxShadow: "var(--shadow-neon-cyan)" }}
                     >
                       DEPLOY TO RUNNER QUEUE
                     </button>
@@ -1332,7 +1439,7 @@ export default function App() {
               <div className="glass-panel" style={{ padding: "18px", display: "flex", alignItems: "center", gap: "14px" }}>
                 <div style={{ width: "12px", height: "12px", borderRadius: "50%", background: engineActive ? "var(--color-green)" : "var(--color-red)", boxShadow: engineActive ? "var(--shadow-neon-green)" : "var(--shadow-neon-red)" }} className={engineActive ? "pulse-glow" : ""}></div>
                 <div>
-                  <h4 style={{ color: "#fff", fontSize: "0.95rem" }}>
+                  <h4 style={{ color: "var(--color-text-main)", fontSize: "0.95rem" }}>
                     Engine Runtime Node: {engineActive ? "RUNNING" : "STOPPED"}
                   </h4>
                   <p style={{ fontSize: "0.8rem", color: "var(--color-text-muted)" }}>
@@ -1368,7 +1475,7 @@ export default function App() {
                     <span className={openPositionsAll.length > 0 ? "badge-active" : "badge-upcoming"}>
                       {openPositionsAll.length > 0 ? "POSITION ACTIVE" : "NO OPEN POSITION"}
                     </span>
-                    <p style={{ color: "#fff", fontWeight: "600", marginTop: "8px" }}>
+                    <p style={{ color: "var(--color-text-main)", fontWeight: "600", marginTop: "8px" }}>
                       {openPositionsAll.length > 0 ? openPositionsAll[0].trading_symbol : "Waiting for crossover"}
                     </p>
                     <p style={{ fontSize: "0.8rem", color: "var(--color-text-muted)" }}>
@@ -1386,7 +1493,7 @@ export default function App() {
                     {currentStrike}
                   </h4>
                   <h3 style={{ fontSize: "2rem", color: "var(--color-cyan)", textShadow: "var(--shadow-neon-cyan)", margin: 0 }}>
-                    ₹{fmt(currentLtp)}
+                    ₹{fmt(atmLtp)}
                   </h3>
                 </div>
               </div>
@@ -1399,14 +1506,14 @@ export default function App() {
                   </h4>
                   <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
                     <span style={{ fontSize: "0.78rem", color: "var(--color-cyan)" }}>
-                      LTP: ₹{fmt(currentLtp)}
+                      LTP: ₹{fmt(atmLtp)}
                     </span>
                     <ChartModeToggle mode={chartMode} onChange={setChartMode} />
                   </div>
                 </div>
-                <div style={{ background: "rgba(0,0,0,0.45)", borderRadius: "8px", padding: "6px", overflow: "hidden" }}>
+                <div style={{ background: "var(--bg-inset)", borderRadius: "8px", padding: "6px", overflow: "hidden" }}>
                   {atmRef.current.key ? (
-                    <CandleChart apiBase={API_BASE} token={token} instrumentKey={atmRef.current.key} mode={chartMode} height={240} liveLtp={liveQuote(atmRef.current.key).ltp ?? currentLtp} />
+                    <CandleChart apiBase={API_BASE} token={token} instrumentKey={atmRef.current.key} mode={chartMode} height={240} liveLtp={atmLtp} theme={theme} />
                   ) : (
                     <p style={{ color: "var(--color-text-muted)", fontSize: "0.85rem", padding: "25px", textAlign: "center" }}>Waiting for the option chain…</p>
                   )}
@@ -1426,17 +1533,17 @@ export default function App() {
                     Clear Terminal
                   </button>
                 </div>
-                <div style={{ background: "#050308", border: "1px solid #1f122e", borderRadius: "8px", padding: "14px", flex: 1, overflowY: "auto", maxHeight: "250px", fontFamily: "var(--font-mono)", fontSize: "0.82rem", color: "#10b981", display: "flex", flexDirection: "column", gap: "6px" }}>
+                <div style={{ background: "#050308", border: "1px solid #1f122e", borderRadius: "8px", padding: "14px", flex: 1, overflowY: "auto", maxHeight: "250px", fontFamily: "var(--font-mono)", fontSize: "0.82rem", color: "var(--color-green)", display: "flex", flexDirection: "column", gap: "6px" }}>
                   {eventLogs.length === 0 ? (
-                    <p style={{ color: "#06b6d4" }}>[SYS] Awaiting strategy engine crossover triggers...</p>
+                    <p style={{ color: "var(--color-cyan)" }}>[SYS] Awaiting strategy engine crossover triggers...</p>
                   ) : (
                     eventLogs.map((log, idx) => (
                       <div key={idx} style={{ display: "flex", gap: "8px" }}>
                         <span style={{ color: "rgba(16,185,129,0.5)" }}>[{log.ts}]</span>
-                        <span style={{ color: log.type === "System" ? "var(--color-cyan)" : log.type === "OrderFilled" ? "var(--color-green)" : log.type === "OrderPlaced" ? "var(--color-secondary)" : "#10b981" }}>
+                        <span style={{ color: log.type === "System" ? "var(--color-cyan)" : log.type === "OrderFilled" ? "var(--color-green)" : log.type === "OrderPlaced" ? "var(--color-secondary)" : "var(--color-green)" }}>
                           [{log.type}]
                         </span>
-                        <span style={{ color: "#e5e7eb" }}>{log.message}</span>
+                        <span style={{ color: "var(--color-text-soft)" }}>{log.message}</span>
                       </div>
                     ))
                   )}
@@ -1482,7 +1589,7 @@ export default function App() {
               {/* Total Trades Executed */}
               <div className="glass-panel" style={{ padding: "20px" }}>
                 <span style={{ color: "var(--color-text-muted)", fontSize: "0.8rem", textTransform: "uppercase" }}>Total Trades</span>
-                <h3 style={{ fontSize: "1.8rem", fontWeight: "800", color: "#fff", marginTop: "6px" }}>
+                <h3 style={{ fontSize: "1.8rem", fontWeight: "800", color: "var(--color-text-main)", marginTop: "6px" }}>
                   {portfolioSummary?.total_trades ?? tradesList.length}
                 </h3>
                 <div style={{ fontSize: "0.75rem", color: "var(--color-text-muted)", marginTop: "4px" }}>
@@ -1511,7 +1618,7 @@ export default function App() {
                   <select
                     value={tradeFilterSegment}
                     onChange={(e) => setTradeFilterSegment(e.target.value)}
-                    style={{ padding: "8px 12px", borderRadius: "6px", background: "#110c1c", color: "#fff", border: "1px solid var(--border-glow)", fontSize: "0.85rem" }}
+                    style={{ padding: "8px 12px", borderRadius: "6px", background: "var(--bg-input)", color: "var(--color-text-main)", border: "1px solid var(--border-glow)", fontSize: "0.85rem" }}
                   >
                     <option value="ALL">All Segments</option>
                     <option value="FNO">F&O (Options)</option>
@@ -1524,7 +1631,7 @@ export default function App() {
                   <select
                     value={tradeFilterSide}
                     onChange={(e) => setTradeFilterSide(e.target.value)}
-                    style={{ padding: "8px 12px", borderRadius: "6px", background: "#110c1c", color: "#fff", border: "1px solid var(--border-glow)", fontSize: "0.85rem" }}
+                    style={{ padding: "8px 12px", borderRadius: "6px", background: "var(--bg-input)", color: "var(--color-text-main)", border: "1px solid var(--border-glow)", fontSize: "0.85rem" }}
                   >
                     <option value="ALL">All Sides</option>
                     <option value="BUY">BUY Only</option>
@@ -1536,7 +1643,7 @@ export default function App() {
               <div style={{ display: "flex", gap: "10px" }}>
                 <button
                   onClick={fetchTrades}
-                  style={{ padding: "8px 16px", borderRadius: "6px", border: "1px solid var(--border-glow)", background: "rgba(255,255,255,0.06)", color: "#fff", fontSize: "0.85rem", cursor: "pointer" }}
+                  style={{ padding: "8px 16px", borderRadius: "6px", border: "1px solid var(--border-glow)", background: "var(--line)", color: "var(--color-text-main)", fontSize: "0.85rem", cursor: "pointer" }}
                 >
                   🔄 Refresh Trades
                 </button>
@@ -1583,10 +1690,10 @@ export default function App() {
                         <td style={{ fontFamily: "var(--font-mono)", fontSize: "0.78rem", color: "var(--color-cyan)" }}>
                           {t.broker_order_id ? t.broker_order_id.slice(0, 14) : t.id.slice(0, 8)}
                         </td>
-                        <td style={{ fontSize: "0.82rem", color: "#d1d5db" }}>
+                        <td style={{ fontSize: "0.82rem", color: "var(--color-text-soft)" }}>
                           {t.strategy_name || "WMA5/SMA1 Crossover"}
                         </td>
-                        <td style={{ fontWeight: "700", color: "#fff" }}>
+                        <td style={{ fontWeight: "700", color: "var(--color-text-main)" }}>
                           {t.trading_symbol}
                         </td>
                         <td>
@@ -1602,7 +1709,7 @@ export default function App() {
                         <td style={{ fontWeight: "600" }}>
                           {t.quantity}
                         </td>
-                        <td style={{ fontWeight: "600", color: "#fff" }}>
+                        <td style={{ fontWeight: "600", color: "var(--color-text-main)" }}>
                           ₹{t.execution_price.toFixed(2)}
                         </td>
                         <td>
@@ -1652,7 +1759,7 @@ export default function App() {
               </div>
               {upstox.connected && (
                 <div style={{ fontSize: "0.8rem", color: "var(--color-text-muted)", marginTop: "10px" }}>
-                  {upstox.user_name && <>Account: <strong style={{ color: "#fff" }}>{upstox.user_name}</strong> · </>}
+                  {upstox.user_name && <>Account: <strong style={{ color: "var(--color-text-main)" }}>{upstox.user_name}</strong> · </>}
                   Valid until {new Date(upstox.expires_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}
                 </div>
               )}
@@ -1666,7 +1773,7 @@ export default function App() {
               ) : (
                 <button
                   onClick={upstox.connected ? handleUpstoxDisconnect : handleUpstoxConnect}
-                  style={{ width: "100%", marginTop: "14px", padding: "12px", borderRadius: "8px", border: upstox.connected ? "1px solid var(--border-glow)" : "none", cursor: "pointer", background: upstox.connected ? "transparent" : "var(--color-cyan)", color: "#fff", fontWeight: "700" }}
+                  style={{ width: "100%", marginTop: "14px", padding: "12px", borderRadius: "8px", border: upstox.connected ? "1px solid var(--border-glow)" : "none", cursor: "pointer", background: upstox.connected ? "transparent" : "var(--color-cyan)", color: upstox.connected ? "var(--color-text-main)" : "var(--on-accent)", fontWeight: "700" }}
                 >
                   {upstox.connected ? "Disconnect" : "Connect Upstox"}
                 </button>
@@ -1684,10 +1791,10 @@ export default function App() {
               </div>
 
               {/* Current Active Broker Card */}
-              <div style={{ background: "rgba(0,0,0,0.3)", borderRadius: "10px", padding: "14px 18px", border: "1px solid var(--border-glow)", marginBottom: "24px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ background: "var(--bg-inset)", borderRadius: "10px", padding: "14px 18px", border: "1px solid var(--border-glow)", marginBottom: "24px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <div>
                   <div style={{ fontSize: "0.75rem", color: "var(--color-text-muted)", textTransform: "uppercase" }}>Currently Connected</div>
-                  <div style={{ fontWeight: "700", color: "#fff", fontSize: "1rem" }}>
+                  <div style={{ fontWeight: "700", color: "var(--color-text-main)", fontSize: "1rem" }}>
                     {brokerStatus.broker_name || "Paper Trading Simulator"}
                   </div>
                   <div style={{ fontSize: "0.8rem", color: "var(--color-cyan)" }}>
@@ -1705,7 +1812,7 @@ export default function App() {
                   <select
                     value={brokerName}
                     onChange={(e) => setBrokerName(e.target.value)}
-                    style={{ width: "100%", padding: "12px", borderRadius: "8px", background: "#110c1c", color: "#fff", border: "1px solid var(--border-glow)" }}
+                    style={{ width: "100%", padding: "12px", borderRadius: "8px", background: "var(--bg-input)", color: "var(--color-text-main)", border: "1px solid var(--border-glow)" }}
                   >
                     <option value="paper_trading">Paper Trading Simulator (Default - Risk-Free)</option>
                     <option value="kite">Zerodha Kite Connect API</option>
@@ -1723,7 +1830,7 @@ export default function App() {
                     placeholder={brokerName === "paper_trading" ? "e.g. ALGO_PAPER_01" : "Broker Client ID"}
                     value={clientId}
                     onChange={(e) => setClientId(e.target.value)}
-                    style={{ width: "100%", padding: "12px", borderRadius: "8px", background: "#110c1c", color: "#fff", border: "1px solid var(--border-glow)" }}
+                    style={{ width: "100%", padding: "12px", borderRadius: "8px", background: "var(--bg-input)", color: "var(--color-text-main)", border: "1px solid var(--border-glow)" }}
                   />
                 </div>
 
@@ -1737,7 +1844,7 @@ export default function App() {
                     placeholder={brokerName === "paper_trading" ? "paper_key_vault" : "Broker API Key"}
                     value={apiKey}
                     onChange={(e) => setApiKey(e.target.value)}
-                    style={{ width: "100%", padding: "12px", borderRadius: "8px", background: "#110c1c", color: "#fff", border: "1px solid var(--border-glow)" }}
+                    style={{ width: "100%", padding: "12px", borderRadius: "8px", background: "var(--bg-input)", color: "var(--color-text-main)", border: "1px solid var(--border-glow)" }}
                   />
                 </div>
 
@@ -1751,7 +1858,7 @@ export default function App() {
                       placeholder="API Secret Key"
                       value={apiSecret}
                       onChange={(e) => setApiSecret(e.target.value)}
-                      style={{ width: "100%", padding: "12px", borderRadius: "8px", background: "#110c1c", color: "#fff", border: "1px solid var(--border-glow)" }}
+                      style={{ width: "100%", padding: "12px", borderRadius: "8px", background: "var(--bg-input)", color: "var(--color-text-main)", border: "1px solid var(--border-glow)" }}
                     />
                   </div>
                 )}
@@ -1762,7 +1869,7 @@ export default function App() {
                 <button
                   type="submit"
                   disabled={verifyingBroker}
-                  style={{ padding: "14px", borderRadius: "8px", border: "none", cursor: "pointer", background: "var(--color-cyan)", color: "#fff", fontWeight: "700", fontSize: "0.95rem", boxShadow: "var(--shadow-neon-cyan)", marginTop: "6px" }}
+                  style={{ padding: "14px", borderRadius: "8px", border: "none", cursor: "pointer", background: "var(--color-cyan)", color: "var(--on-accent)", fontWeight: "700", fontSize: "0.95rem", boxShadow: "var(--shadow-neon-cyan)", marginTop: "6px" }}
                 >
                   {verifyingBroker ? "Authenticating Account..." : "Test Connection & Store Credentials"}
                 </button>
@@ -1770,6 +1877,7 @@ export default function App() {
             </div>
           </div>
         )}
+        </div>
 
       </main>
 
@@ -1797,7 +1905,7 @@ export default function App() {
               </div>
 
               <div className="sheet-chart">
-                <CandleChart apiBase={API_BASE} token={token} instrumentKey={ticket.instrument_key} mode={chartMode} height={200} liveLtp={q.ltp ?? null} />
+                <CandleChart apiBase={API_BASE} token={token} instrumentKey={ticket.instrument_key} mode={chartMode} height={200} liveLtp={q.ltp ?? null} theme={theme} />
               </div>
 
               <div className="seg-toggle">
@@ -1839,14 +1947,14 @@ export default function App() {
               </div>
 
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.82rem", color: "var(--color-text-muted)", margin: "4px 0 12px" }}>
-                <span>Approx. {isBuy ? "premium" : "credit"}: <strong style={{ color: "#fff" }}>₹{fmt((estPrice || 0) * qty)}</strong></span>
+                <span>Approx. {isBuy ? "premium" : "credit"}: <strong style={{ color: "var(--color-text-main)" }}>₹{fmt((estPrice || 0) * qty)}</strong></span>
                 <span>Avail. ₹{fmt(userProfile?.virtual_balance ?? 0, 0)}</span>
               </div>
 
               <button
                 disabled={placingOrder || (ticketType === "LIMIT" && !ticketPrice)}
                 onClick={handlePlaceTicket}
-                style={{ width: "100%", padding: "14px", borderRadius: "10px", border: "none", cursor: "pointer", background: accent, color: "#fff", fontWeight: "800", fontSize: "1rem" }}
+                style={{ width: "100%", padding: "14px", borderRadius: "10px", border: "none", cursor: "pointer", background: accent, color: "var(--on-accent)", fontWeight: "800", fontSize: "1rem" }}
               >
                 {placingOrder ? "Placing…" : `${ticket.side} ${qty} @ ${ticketType === "LIMIT" ? fmt(Number(ticketPrice)) : "MARKET"}`}
               </button>
@@ -1864,12 +1972,12 @@ export default function App() {
 
       {/* Upcoming Soon Segment Modal */}
       {upcomingModal && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", backdropFilter: "blur(4px)", display: "flex", justifyContent: "center", alignItems: "center", zIndex: 1000, padding: "20px" }}>
+        <div style={{ position: "fixed", inset: 0, background: "var(--backdrop)", backdropFilter: "blur(4px)", display: "flex", justifyContent: "center", alignItems: "center", zIndex: 1000, padding: "20px" }}>
           <div className="glass-panel" style={{ maxWidth: "420px", padding: "32px", textAlign: "center", border: "1px solid rgba(245, 158, 11, 0.4)", boxShadow: "0 0 25px rgba(245, 158, 11, 0.2)" }}>
             <span className="badge-upcoming shimmer-badge" style={{ fontSize: "0.82rem", padding: "4px 12px" }}>
               UPCOMING SOON
             </span>
-            <h3 style={{ color: "#fff", marginTop: "16px", fontSize: "1.3rem" }}>
+            <h3 style={{ color: "var(--color-text-main)", marginTop: "16px", fontSize: "1.3rem" }}>
               {upcomingModal}
             </h3>
             <p style={{ color: "var(--color-text-muted)", fontSize: "0.88rem", marginTop: "10px", lineHeight: 1.5 }}>
@@ -1879,7 +1987,7 @@ export default function App() {
             </p>
             <button
               onClick={() => setUpcomingModal(null)}
-              style={{ marginTop: "20px", padding: "10px 24px", borderRadius: "8px", border: "none", background: "var(--color-primary)", color: "#fff", fontWeight: "600", cursor: "pointer", boxShadow: "var(--shadow-neon-purple)" }}
+              style={{ marginTop: "20px", padding: "10px 24px", borderRadius: "8px", border: "none", background: "var(--color-primary)", color: "var(--on-accent)", fontWeight: "600", cursor: "pointer", boxShadow: "var(--shadow-neon-purple)" }}
             >
               Understand
             </button>

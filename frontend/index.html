@@ -3,8 +3,17 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>frontend</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="description" content="AlgoTrade Pro: live NIFTY options paper trading with an ML agent, strategy engine and risk checks." />
+    <meta name="theme-color" content="#07040f" />
+    <title>AlgoTrade Pro</title>
+    <script>
+      // Apply the saved day/night theme before first paint (no flash of the wrong theme)
+      try {
+        var t = localStorage.getItem("theme");
+        if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="root"></div>

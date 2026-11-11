@@ -74,14 +74,25 @@ async def get_current_user_id(credentials: HTTPAuthorizationCredentials = Depend
 class ConnectionManager:
     """
     Tracks authenticated WebSocket connections per user.
-    Market data is broadcast to everyone; order and strategy events go only to their owner.
+    Market data is broadcast to everyone; order and strategy events go to every device of their owner.
+
+    Each socket gets its own outbound queue and sender task, so publishing never waits on a slow phone
+    connection (the market-data loop and strategies publish through here). If a client falls far behind,
+    its oldest messages are dropped; it re-syncs from the latest quote anyway.
     """
+    QUEUE_LIMIT = 300
+
     def __init__(self):
         self.connections: Dict[str, Set[WebSocket]] = {}
+        self._queues: Dict[WebSocket, asyncio.Queue] = {}
+        self._senders: Dict[WebSocket, asyncio.Task] = {}
 
     async def connect(self, websocket: WebSocket, user_id: str):
         await websocket.accept()
         self.connections.setdefault(user_id, set()).add(websocket)
+        queue: asyncio.Queue = asyncio.Queue(maxsize=self.QUEUE_LIMIT)
+        self._queues[websocket] = queue
+        self._senders[websocket] = asyncio.create_task(self._sender(websocket, user_id, queue))
 
     def disconnect(self, websocket: WebSocket, user_id: str):
         sockets = self.connections.get(user_id)
@@ -89,34 +100,49 @@ class ConnectionManager:
             sockets.discard(websocket)
             if not sockets:
                 self.connections.pop(user_id, None)
+        self._queues.pop(websocket, None)
+        task = self._senders.pop(websocket, None)
+        if task and task is not asyncio.current_task():
+            task.cancel()
 
-    async def _send(self, websocket: WebSocket, user_id: str, message: str):
+    async def _sender(self, websocket: WebSocket, user_id: str, queue: asyncio.Queue):
         try:
-            await websocket.send_text(message)
+            while True:
+                message = await queue.get()
+                await asyncio.wait_for(websocket.send_text(message), timeout=10)
+        except asyncio.CancelledError:
+            pass
         except Exception:
             self.disconnect(websocket, user_id)
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+
+    def _enqueue(self, websocket: WebSocket, message: str):
+        queue = self._queues.get(websocket)
+        if queue is None:
+            return
+        if queue.full():
+            try:
+                queue.get_nowait()  # drop the oldest; fresher data follows
+            except asyncio.QueueEmpty:
+                pass
+        queue.put_nowait(message)
 
     async def broadcast(self, message: str):
-        for user_id, sockets in list(self.connections.items()):
+        for sockets in list(self.connections.values()):
             for ws in list(sockets):
-                await self._send(ws, user_id, message)
+                self._enqueue(ws, message)
+
+    async def send_to_user_socket(self, websocket: WebSocket, message: str):
+        self._enqueue(websocket, message)
 
     async def send_to_user(self, user_id: str, message: str):
         for ws in list(self.connections.get(user_id, ())):
-            await self._send(ws, user_id, message)
+            self._enqueue(ws, message)
 
 manager = ConnectionManager()
-
-def _tick_event(candle: dict) -> str:
-    return json.dumps({
-        "event_type": "TickUpdate",
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        "data": {
-            "instrument_key": candle["instrument_key"],
-            "ltp": candle["close"],
-            "candle": candle
-        }
-    })
 
 def _user_event(event_type: str, data: dict) -> str:
     return json.dumps({
@@ -143,9 +169,7 @@ async def redis_event_bus_listener():
                 await asyncio.sleep(5)
                 continue
 
-            msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-            if msg:
-                await manager.broadcast(_tick_event(json.loads(msg["data"])))
+            await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)  # candles: strategies only
         except (ConnectionError, OSError, Exception):
             # Redis unreachable. We operate silently and rely on the Memory Bus callback
             pubsub = None
@@ -162,8 +186,11 @@ async def memory_bus_ws_callback(channel: str, message: str):
                 "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
                 "data": json.loads(message)
             }))
-        elif channel.startswith("market:candles:"):
-            await manager.broadcast(_tick_event(json.loads(message)))
+        elif channel == "user:events":
+            # Fills, rejections and AI status from strategies/execution: push to every device of that user
+            evt = json.loads(message)
+            await manager.send_to_user(evt["user_id"], _user_event(evt["event_type"], evt.get("data") or {}))
+        # market:candles:* are for strategies only; quotes already carry every price the UI needs
     except Exception:
         pass
 
@@ -591,14 +618,6 @@ async def execute_demo_trade(
         trading_symbol=symbol
     )
 
-    await manager.send_to_user(user_id, _user_event("OrderFilled", {
-        "trading_symbol": symbol,
-        "side": side,
-        "quantity": qty,
-        "fill_price": result.get("fill_price", 150.0),
-        "segment": segment
-    }))
-
     return {"message": "Demo paper trade executed", "result": result}
 
 
@@ -831,6 +850,29 @@ async def get_market_candles(instrument_key: str, user_id: str = Depends(get_cur
                   "low": b["low"], "close": b["close"]} for b in bars],
     }
 
+@app.get("/api/v1/public/overview")
+async def public_overview():
+    """Landing-page data (no login): NIFTY spot, ATM premiums and the AI model's test results."""
+    from app.ml.agent import load_models
+    snap = market_snapshot
+    atm = next((r for r in snap.get("rows", []) if r.get("strike") == snap.get("atm_strike")), None) or {}
+    meta = ((load_models() or {}).get("meta") or {})
+    return {
+        "ticker": {
+            "source": snap.get("source"),
+            "spot": snap.get("spot"),
+            "prev_close": snap.get("spot_prev_close"),
+            "expiry": snap.get("expiry"),
+            "atm_strike": snap.get("atm_strike"),
+            "atm_ce": (atm.get("ce") or {}).get("ltp"),
+            "atm_pe": (atm.get("pe") or {}).get("ltp"),
+        },
+        "ai_model": {
+            "backtest": (meta.get("results") or {}).get("test"),
+            "walk_forward": meta.get("walk_forward"),
+        },
+    }
+
 @app.get("/api/v1/ai/status")
 async def get_ai_status(user_id: str = Depends(get_current_user_id)):
     """The AI agent's latest view for this user, plus how the deployed model did in its backtest."""
@@ -896,14 +938,7 @@ async def place_manual_order(payload: OrderRequest, user_id: str = Depends(get_c
         stop_loss=payload.stop_loss,
         target=payload.target,
     )
-    if result.get("status") == "FILLED":
-        await manager.send_to_user(user_id, _user_event("OrderFilled", {
-            "trading_symbol": payload.trading_symbol or payload.instrument_key,
-            "side": payload.side,
-            "quantity": payload.quantity,
-            "fill_price": result.get("fill_price"),
-        }))
-    return result
+    return result  # OrderFilled / OrderRejected reach every device from ExecutionService
 
 # --- WEBSOCKET ROUTING ---
 @app.websocket("/api/v1/ws/stream")
@@ -919,8 +954,12 @@ async def ws_endpoint(websocket: WebSocket, token: str = Query("")):
     await manager.connect(websocket, user_id)
     try:
         while True:
-            await websocket.receive_text()
+            text = await websocket.receive_text()
+            if text == "ping":  # client heartbeat: lets phones detect a dead connection after sleeping
+                await manager.send_to_user_socket(websocket, json.dumps({"event_type": "Pong", "data": {}}))
     except WebSocketDisconnect:
+        manager.disconnect(websocket, user_id)
+    except Exception:
         manager.disconnect(websocket, user_id)
 
 from fastapi.staticfiles import StaticFiles
