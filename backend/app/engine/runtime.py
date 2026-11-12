@@ -122,65 +122,74 @@ class StrategyRuntime:
                 
             if not signal_intent:
                 return
-                
-            action = signal_intent.get("action")  # BUY, SELL, NONE
-            if action not in ["BUY", "SELL"]:
+            # a strategy may return one signal or a list (e.g. the AI agent exits several trades and enters one)
+            intents = signal_intent if isinstance(signal_intent, list) else [signal_intent]
+            for intent in intents:
+                await self._place_signal(db, intent, candle_ts, open_positions_map, many=len(intents) > 1)
+
+
+    async def _place_signal(self, db: AsyncSession, signal_intent: Dict[str, Any], candle_ts,
+                            open_positions_map: List[Dict[str, Any]], many: bool = False):
+        action = signal_intent.get("action")  # BUY, SELL, NONE
+        if action not in ["BUY", "SELL"]:
+            return
+            
+        instrument_key = signal_intent.get("instrument_key")
+        quantity = signal_intent.get("quantity", self.strategy_instance.parameters.get("quantity", 50))
+        product_type = signal_intent.get("product_type", self.strategy_instance.parameters.get("product_type", "MIS"))
+        entry_price = signal_intent.get("entry_price")
+        stop_loss = signal_intent.get("stop_loss")
+        target = signal_intent.get("target")
+
+        # Risk-based sizing: when the signal carries a stop and the subscription sets
+        # risk_per_trade, size so a stop-out loses at most that amount (exits keep their size)
+        params = self.strategy_instance.parameters
+        risk_per_trade = float(params.get("risk_per_trade") or 0)
+        if risk_per_trade > 0 and entry_price is not None and stop_loss is not None \
+                and not is_exit_order(action, quantity, instrument_key, open_positions_map):
+            quantity = size_from_risk(risk_per_trade, entry_price, stop_loss, int(params.get("lot_size") or 1))
+            if quantity <= 0:
+                logger.warning(
+                    f"Skipping signal for sub={self.subscription_id}: one lot risks more than {risk_per_trade}"
+                )
                 return
-                
-            instrument_key = signal_intent.get("instrument_key")
-            quantity = signal_intent.get("quantity", self.strategy_instance.parameters.get("quantity", 50))
-            product_type = signal_intent.get("product_type", self.strategy_instance.parameters.get("product_type", "MIS"))
-            entry_price = signal_intent.get("entry_price")
-            stop_loss = signal_intent.get("stop_loss")
-            target = signal_intent.get("target")
 
-            # Risk-based sizing: when the signal carries a stop and the subscription sets
-            # risk_per_trade, size so a stop-out loses at most that amount (exits keep their size)
-            params = self.strategy_instance.parameters
-            risk_per_trade = float(params.get("risk_per_trade") or 0)
-            if risk_per_trade > 0 and entry_price is not None and stop_loss is not None \
-                    and not is_exit_order(action, quantity, instrument_key, open_positions_map):
-                quantity = size_from_risk(risk_per_trade, entry_price, stop_loss, int(params.get("lot_size") or 1))
-                if quantity <= 0:
-                    logger.warning(
-                        f"Skipping signal for sub={self.subscription_id}: one lot risks more than {risk_per_trade}"
-                    )
-                    return
+        # 3. Create unique Idempotency Client Order ID
+        # Structure: co_<sub_id>_<candle_timestamp_formatted>_<buy/sell>
+        clean_ts = str(candle_ts).replace(":", "").replace("-", "").replace(" ", "")
+        client_order_id = f"co_{self.subscription_id[:8]}_{clean_ts}_{action.lower()}"
+        if many:  # several orders on one candle: make each contract's id distinct (still deterministic)
+            client_order_id += "_" + uuid.uuid5(uuid.NAMESPACE_URL, instrument_key).hex[:8]
+        
+        # 4. Route Order to Execution Service
+        execution_service = ExecutionService(db)
+        logger.info(f"Signal detected. Placing {action} order for sub={self.subscription_id} key={instrument_key}")
+        
+        result = await execution_service.execute_trade(
+            subscription_id=self.subscription_id,
+            side=action,
+            instrument_key=instrument_key,
+            quantity=quantity,
+            client_order_id=client_order_id,
+            product_type=product_type,
+            trading_symbol=signal_intent.get("trading_symbol"),
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            target=target
+        )
 
-            # 3. Create unique Idempotency Client Order ID
-            # Structure: co_<sub_id>_<candle_timestamp_formatted>_<buy/sell>
-            clean_ts = str(candle_ts).replace(":", "").replace("-", "").replace(" ", "")
-            client_order_id = f"co_{self.subscription_id[:8]}_{clean_ts}_{action.lower()}"
-            
-            # 4. Route Order to Execution Service
-            execution_service = ExecutionService(db)
-            logger.info(f"Signal detected. Placing {action} order for sub={self.subscription_id} key={instrument_key}")
-            
-            result = await execution_service.execute_trade(
-                subscription_id=self.subscription_id,
-                side=action,
-                instrument_key=instrument_key,
-                quantity=quantity,
-                client_order_id=client_order_id,
-                product_type=product_type,
-                trading_symbol=signal_intent.get("trading_symbol"),
-                entry_price=entry_price,
-                stop_loss=stop_loss,
-                target=target
-            )
-
-            # ML agent journal: what it saw and predicted, plus the outcome, for retraining on its own trades
-            journal = signal_intent.get("journal")
-            if journal:
-                try:
-                    sub = await db.get(StrategySubscription, self.subscription_id)
-                    await log_audit(
-                        db=db, user_id=sub.user_id, event_type="AI_TRADE_JOURNAL",
-                        message=f"AI {action} {signal_intent.get('trading_symbol') or instrument_key}: "
-                                f"{(result or {}).get('status')}",
-                        metadata_json={**journal, "action": action, "instrument_key": instrument_key,
-                                       "client_order_id": client_order_id, "candle_time": str(candle_ts),
-                                       "result": result},
-                    )
-                except Exception as e:
-                    logger.warning(f"Could not write AI journal: {e}")
+        # ML agent journal: what it saw and predicted, plus the outcome, for retraining on its own trades
+        journal = signal_intent.get("journal")
+        if journal:
+            try:
+                sub = await db.get(StrategySubscription, self.subscription_id)
+                await log_audit(
+                    db=db, user_id=sub.user_id, event_type="AI_TRADE_JOURNAL",
+                    message=f"AI {action} {signal_intent.get('trading_symbol') or instrument_key}: "
+                            f"{(result or {}).get('status')}",
+                    metadata_json={**journal, "action": action, "instrument_key": instrument_key,
+                                   "client_order_id": client_order_id, "candle_time": str(candle_ts),
+                                   "result": result},
+                )
+            except Exception as e:
+                logger.warning(f"Could not write AI journal: {e}")

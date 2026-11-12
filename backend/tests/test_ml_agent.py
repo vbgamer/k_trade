@@ -149,7 +149,7 @@ def test_agent_buys_when_prediction_clears_threshold_and_journals_features():
     k, _ = _seed_market(10 * 60 + 30)
     a = _agent(threshold=-1.0)  # everything clears
     a.clock = lambda: _ist(10, 31, 1)
-    sig = asyncio.run(a.on_candle(_candle(10 * 60 + 30), []))
+    [sig] = asyncio.run(a.on_candle(_candle(10 * 60 + 30), []))
     assert sig["action"] == "BUY" and sig["quantity"] == 65
     assert sig["instrument_key"] in (f"NSE_FO|{k}CE", f"NSE_FO|{k}PE")
     assert sig["stop_loss"] < sig["entry_price"] < sig["target"]
@@ -189,20 +189,65 @@ def test_agent_exits_on_stop_and_at_squareoff():
     a = _agent(threshold=-1.0)
     a.sim = SIM  # pin the exit rules (the deployed model's rule can change on retrain)
     a.clock = lambda: _ist(10, 31, 1)
-    a.entry = {"key": key, "minute": 10 * 60 + 20, "price": 100.0}
+    a.entries = {key: {"minute": 10 * 60 + 20, "price": 100.0}}
+    a.max_trades = 0  # no new entries: this test is about exits
     in_memory_quotes[key] = {"ltp": 99.0, "bid": 98.9, "ask": 99.1}
     minute_bars[key] = [{"minute": 630, "open": 100, "high": 101, "low": 97, "close": 99},
                         {"minute": 631, "open": 99, "high": 99, "low": 99, "close": 99}]
     assert asyncio.run(a.on_candle(_candle(630), [pos])) is None  # -3%: hold
 
     minute_bars[key][0]["low"] = 90.0  # dipped through the 8% stop during the last minute
-    sig = asyncio.run(a.on_candle(_candle(630), [pos]))
+    [sig] = asyncio.run(a.on_candle(_candle(630), [pos]))
     assert sig["action"] == "SELL" and sig["quantity"] == 65 and sig["journal"]["exit_reason"] == "stop"
 
     minute_bars[key][0]["low"] = 97.0
     a.clock = lambda: _ist(15, 15, 3)
-    sig = asyncio.run(a.on_candle(_candle(914), [pos]))
+    [sig] = asyncio.run(a.on_candle(_candle(914), [pos]))
     assert sig["journal"]["exit_reason"] == "squareoff"
+
+
+def _pos(key, qty=65, avg=100.0):
+    return {"instrument_key": key, "trading_symbol": key.split("|")[1], "quantity": qty, "average_price": avg}
+
+
+def test_agent_holds_up_to_three_trades_at_once():
+    k, _ = _seed_market(10 * 60 + 30)
+    a = _agent(threshold=-1.0)
+    a.clock = lambda: _ist(10, 31, 1)
+    a.max_trades = 10
+    others = [_pos("NSE_FO|A1"), _pos("NSE_FO|A2")]
+    for p in others:
+        in_memory_quotes[p["instrument_key"]] = {"ltp": 100.0, "bid": 100.0, "ask": 100.1}
+    [sig] = asyncio.run(a.on_candle(_candle(630), others))  # 2 open, room for a third
+    assert sig["action"] == "BUY" and sig["instrument_key"] not in {p["instrument_key"] for p in others}
+    assert ai_status["u-test"]["max_open"] == 3 and len(ai_status["u-test"]["positions"]) == 2
+
+    third = _pos(sig["instrument_key"])
+    in_memory_quotes[third["instrument_key"]] = {"ltp": 100.0, "bid": 100.0, "ask": 100.1}
+    assert asyncio.run(a.on_candle(_candle(631), others + [third])) is None  # 3 open: full
+    assert "maximum" in ai_status["u-test"]["message"]
+
+
+def test_agent_never_doubles_up_on_a_held_contract_and_exits_plus_enters_together():
+    k, _ = _seed_market(10 * 60 + 30)
+    a = _agent(threshold=-1.0)
+    a.sim = SIM
+    a.clock = lambda: _ist(10, 31, 1)
+    a.max_trades = 10
+    # the model's pick is already held -> no new order for it
+    [pick] = asyncio.run(_agent(threshold=-1.0).on_candle(_candle(630), []))
+    held = _pos(pick["instrument_key"], avg=float(pick["entry_price"]))
+    in_memory_quotes[held["instrument_key"]] = {"ltp": pick["entry_price"], "bid": pick["entry_price"], "ask": pick["entry_price"]}
+    assert asyncio.run(a.on_candle(_candle(630), [held])) is None
+    assert "already held" in ai_status["u-test"]["message"]
+
+    # one held trade hits its stop while the pick is free: exit it and enter in the same minute
+    loser = _pos("NSE_FO|LOSER")
+    in_memory_quotes["NSE_FO|LOSER"] = {"ltp": 80.0, "bid": 80.0, "ask": 80.2}
+    a.entries = {"NSE_FO|LOSER": {"minute": 620, "price": 100.0}}
+    sigs = asyncio.run(a.on_candle(_candle(631), [loser]))
+    assert [s["action"] for s in sigs] == ["SELL", "BUY"]
+    assert sigs[0]["instrument_key"] == "NSE_FO|LOSER" and sigs[0]["journal"]["exit_reason"] == "stop"
 
 
 def test_agent_ignores_other_candles():
@@ -340,3 +385,33 @@ def test_ai_lab_is_admin_only(client, make_user, monkeypatch):
     assert {"train", "validation", "test", "rounds"} <= set(body["report"]["learning_curves"]["ce"])
     assert body["journal"] == [] and "status" in body["live"]
     assert client.get("/api/v1/admin/ai-lab").status_code in (401, 403)
+
+
+def test_runtime_places_every_signal_from_one_candle_with_distinct_order_ids(client, monkeypatch):
+    from app.core.database import async_session_maker
+    from app.engine import runtime as rt
+
+    placed = []
+
+    class FakeExecution:
+        def __init__(self, db):
+            pass
+
+        async def execute_trade(self, **kw):
+            placed.append(kw)
+            return {"ok": True, "status": "FILLED", "fill_price": 100.0}
+
+    class TwoSignals:
+        parameters = {"quantity": 65}
+
+        async def on_candle(self, candle_data, open_positions):
+            return [{"action": "SELL", "instrument_key": "NSE_FO|X", "quantity": 65},
+                    {"action": "BUY", "instrument_key": "NSE_FO|Y", "quantity": 65}]
+
+    monkeypatch.setattr(rt, "ExecutionService", FakeExecution)
+    r = rt.StrategyRuntime("sub-test-0001", async_session_maker)
+    r.active, r.strategy_instance = True, TwoSignals()
+    asyncio.run(r.process_candle({"time": "2026-11-12 10:31"}))
+    assert [p["side"] for p in placed] == ["SELL", "BUY"]
+    ids = [p["client_order_id"] for p in placed]
+    assert len(set(ids)) == 2 and all(i.startswith("co_sub-test_202611121031_") for i in ids)

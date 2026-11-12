@@ -74,6 +74,7 @@ export default function App() {
   const [aiInfo, setAiInfo] = useState(null);
   const [aiMode, setAiMode] = useState("auto");
   const [aiMaxTrades, setAiMaxTrades] = useState(3);
+  const [aiMaxOpen, setAiMaxOpen] = useState(3); // AI trades held at the same time
   const isAiStrategy = selectedStrategy?.slug === "aiOptionsAgent";
   const [subscriptionId, setSubscriptionId] = useState(null);
   const [engineActive, setEngineActive] = useState(false);
@@ -471,6 +472,7 @@ export default function App() {
         setRunningVersionId(running.strategy_version_id);
         if (running.config_json?.ai_mode) setAiMode(running.config_json.ai_mode);
         if (running.config_json?.max_trades_per_day) setAiMaxTrades(running.config_json.max_trades_per_day);
+        if (running.config_json?.max_open_positions) setAiMaxOpen(running.config_json.max_open_positions);
       } else {
         setEngineActive(false);
       }
@@ -680,7 +682,7 @@ export default function App() {
           max_profit: Number(maxProfit),
           max_loss: Number(maxLoss),
           config_json: isAiStrategy
-            ? { bypass_scheduler: bypassScheduler, ai_mode: aiMode, max_trades_per_day: aiMaxTrades }
+            ? { bypass_scheduler: bypassScheduler, ai_mode: aiMode, max_trades_per_day: aiMaxTrades, max_open_positions: aiMaxOpen }
             : { timeframeMin: timeframe, bypass_scheduler: bypassScheduler }
         })
       });
@@ -1189,7 +1191,7 @@ export default function App() {
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
                       <span style={{ fontWeight: "700" }}>🤖 AI Agent</span>
                       <span style={{ fontSize: "0.75rem", color: "var(--color-text-muted)" }}>
-                        {st ? `${st.mode === "auto" ? "Auto" : "Suggest"} · ${st.trades_today}/${st.max_trades} trades` : "Not running"}
+                        {st ? `${st.mode === "auto" ? "Auto trading" : "Suggest only"} · ${st.positions?.length || 0}/${st.max_open || 1} open · ${st.trades_today}/${st.max_trades} today` : "Not running"}
                       </span>
                     </div>
                     {st ? (
@@ -1202,15 +1204,19 @@ export default function App() {
                             <span style={{ color: "var(--color-text-muted)" }}>need &gt; {pct(st.threshold)}</span>
                           </div>
                         )}
-                        {st.status === "in_trade" && (
-                          <div style={{ fontFamily: "var(--font-mono)", fontSize: "0.82rem", color: "var(--color-text-muted)" }}>
-                            Entry ₹{fmt(st.entry_price)} · SL ₹{fmt(st.stop)} · Target ₹{fmt(st.target)}
+                        {(st.positions || []).map((p) => (
+                          <div key={p.symbol} style={{ display: "flex", justifyContent: "space-between", gap: "8px", flexWrap: "wrap", fontFamily: "var(--font-mono)", fontSize: "0.8rem", marginTop: "6px", paddingTop: "6px", borderTop: "1px solid var(--line)" }}>
+                            <span style={{ color: "var(--color-text-main)" }}>{p.symbol}</span>
+                            <span style={{ color: p.pnl_pct > 0 ? "var(--color-green)" : p.pnl_pct < 0 ? "var(--color-red)" : "var(--color-text-muted)" }}>
+                              {p.pnl_pct == null ? "—" : `${p.pnl_pct > 0 ? "+" : ""}${p.pnl_pct.toFixed(1)}%`}
+                            </span>
+                            <span style={{ color: "var(--color-text-muted)", width: "100%" }}>Entry ₹{fmt(p.entry_price)} · SL ₹{fmt(p.stop)} · Target ₹{fmt(p.target)}</span>
                           </div>
-                        )}
+                        ))}
                       </>
                     ) : (
                       <div style={{ fontSize: "0.85rem", color: "var(--color-text-muted)" }}>
-                        Start "AI Options Agent (ML)" from the Dashboard to get live suggestions.
+                        Start "AI Options Agent (ML)" from the Dashboard in Auto trade mode and it buys and sells by itself (up to 3 trades open at once).
                       </div>
                     )}
                     {bt && (
@@ -1336,15 +1342,19 @@ export default function App() {
                   </div>
 
                   {isAiStrategy && (
-                    <div style={{ display: "flex", gap: "10px" }}>
-                      <div style={{ width: "50%" }}>
+                    <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+                      <div style={{ flex: "1 1 100%" }}>
                         <label style={{ fontSize: "0.82rem", color: "var(--color-text-muted)", display: "block", marginBottom: "5px" }}>AI Mode</label>
                         <select value={aiMode} disabled={engineActive} onChange={(e) => setAiMode(e.target.value)} style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "var(--bg-input)", color: "var(--color-text-main)", border: "1px solid var(--border-glow)" }}>
-                          <option value="auto">Auto trade</option>
-                          <option value="suggest">Suggest only</option>
+                          <option value="auto">Auto trade: buys and sells by itself</option>
+                          <option value="suggest">Suggest only: you place the trades</option>
                         </select>
                       </div>
-                      <div style={{ width: "50%" }}>
+                      <div style={{ flex: "1 1 45%" }}>
+                        <label style={{ fontSize: "0.82rem", color: "var(--color-text-muted)", display: "block", marginBottom: "5px" }}>Max open at once</label>
+                        <input type="number" min={1} max={5} value={aiMaxOpen} disabled={engineActive} onChange={(e) => setAiMaxOpen(Math.max(1, Math.min(5, Number(e.target.value) || 1)))} style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "var(--bg-input)", color: "var(--color-text-main)", border: "1px solid var(--border-glow)" }} />
+                      </div>
+                      <div style={{ flex: "1 1 45%" }}>
                         <label style={{ fontSize: "0.82rem", color: "var(--color-text-muted)", display: "block", marginBottom: "5px" }}>Max trades / day</label>
                         <input type="number" min={1} max={10} value={aiMaxTrades} disabled={engineActive} onChange={(e) => setAiMaxTrades(Number(e.target.value))} style={{ width: "100%", padding: "10px", borderRadius: "6px", background: "var(--bg-input)", color: "var(--color-text-main)", border: "1px solid var(--border-glow)" }} />
                       </div>

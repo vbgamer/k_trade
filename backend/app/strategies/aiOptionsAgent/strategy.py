@@ -3,8 +3,9 @@
 Every closed NIFTY minute (09:45-14:30) it rebuilds the exact training features from live data, asks the two
 LightGBM models (ATM CE / ATM PE) for the expected net reward of buying now, and
   * mode "suggest": only publishes the suggestion (Trade screen card)
-  * mode "auto":    buys the better side when its predicted reward clears the trained threshold.
-Open trades exit on the rules the model was trained with: stop, target, time limit, 15:15 square-off.
+  * mode "auto":    buys the better side when its predicted reward clears the trained threshold, holding up to
+                     max_open_positions trades at once (never the same contract twice) and max_trades_per_day in total.
+Every open trade exits on the rules the model was trained with: stop, target, time limit, 15:15 square-off.
 Every entry carries a journal (features + predictions) that is written to the audit log, so the model can
 be retrained on its own trades (the reward feedback loop).
 """
@@ -36,19 +37,21 @@ class AIOptionsAgent(BaseStrategy):
         self.product_type = parameters.get("product_type", "MIS")
         self.mode = parameters.get("ai_mode", "auto")
         self.max_trades = int(parameters.get("max_trades_per_day") or 3)
+        self.max_open = max(1, int(parameters.get("max_open_positions") or 3))
         self.models = agent.load_models()
         meta = (self.models or {}).get("meta", {})
         self.sim = meta.get("sim", {"target_pct": 0.15, "stop_pct": 0.08, "max_hold_min": 30})
         self.threshold = float(parameters.get("ai_threshold", meta.get("threshold", 0.0)))
         self.day: Optional[date] = None
         self.trades_today = 0
-        self.entry: Optional[Dict[str, Any]] = None  # {"key", "minute", "price"}
+        self.entries: Dict[str, Dict[str, Any]] = {}  # instrument_key -> {"minute", "price", "symbol"}
         self.clock = lambda: datetime.now(IST)  # injectable for tests
 
     def _publish(self, **state):
         user_id = self.parameters.get("user_id") or "unknown"
         ai_status[user_id] = {"updated_at": time.time(), "mode": self.mode, "threshold": self.threshold,
-                                 "trades_today": self.trades_today, "max_trades": self.max_trades, **state}
+                                 "trades_today": self.trades_today, "max_trades": self.max_trades,
+                                 "max_open": self.max_open, "positions": self._holdings, **state}
         try:  # push to every open device so phone and laptop show the same card instantly
             task = asyncio.get_running_loop().create_task(
                 publish_user_event(user_id, "AIStatus", ai_status[user_id]))
@@ -57,24 +60,47 @@ class AIOptionsAgent(BaseStrategy):
         except RuntimeError:
             pass  # no running loop (unit tests calling synchronously)
 
-    async def on_candle(self, candle_data: Dict[str, Any], open_positions: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    async def on_candle(self, candle_data: Dict[str, Any], open_positions: List[Dict[str, Any]]):
+        """Returns a list of order signals (exits first, then at most one new entry), or None."""
         if candle_data.get("instrument_key") != MINUTE_BAR_KEY:
             return None
         now = self.clock()
         if self.day != now.date():
-            self.day, self.trades_today, self.entry = now.date(), 0, None
+            self.day, self.trades_today, self.entries = now.date(), 0, {}
         bar_minute = int(candle_data["minute"])
         minute_now = now.hour * 60 + now.minute
 
-        if open_positions:
-            return self._manage_exit(open_positions[0], minute_now)
-        self.entry = None
+        held = {p["instrument_key"]: p for p in open_positions if p.get("quantity", 0) > 0}
+        self.entries = {k: v for k, v in self.entries.items() if k in held}
+        signals = [sig for sig in (self._manage_exit(pos, minute_now) for pos in held.values()) if sig]
+        closing = {sig["instrument_key"] for sig in signals}
+        self._holdings = [self._holding(pos) for pos in held.values()]
+        entry = self._maybe_enter(bar_minute, now, minute_now,
+                                  open_after_exits=len(held) - len(closing), held_keys=set(held))
+        if entry:
+            signals.append(entry)
+        return signals or None
 
+    _holdings: List[Dict[str, Any]] = []
+
+    def _holding(self, pos: Dict[str, Any]) -> Dict[str, Any]:
+        e = self.entries[pos["instrument_key"]]
+        q = in_memory_quotes.get(pos["instrument_key"]) or {}
+        ltp = q.get("bid") or q.get("ltp")
+        return {"symbol": pos.get("trading_symbol"), "entry_price": e["price"], "ltp": ltp,
+                "pnl_pct": round((ltp / e["price"] - 1) * 100, 2) if ltp else None,
+                "stop": round(e["price"] * (1 - self.sim["stop_pct"]), 2),
+                "target": round(e["price"] * (1 + self.sim["target_pct"]), 2)}
+
+    def _maybe_enter(self, bar_minute: int, now: datetime, minute_now: int, *, open_after_exits: int,
+                     held_keys: set) -> Optional[Dict[str, Any]]:
+        holding = f" · holding {open_after_exits}/{self.max_open}" if open_after_exits else ""
         if not self.models:
             self._publish(status="no_model", message="No trained model deployed")
             return None
         if not (agent.FIRST_DECISION <= bar_minute <= agent.LAST_DECISION):
-            self._publish(status="idle", message="Outside entry window (09:45-14:30)")
+            self._publish(status="in_trade" if open_after_exits else "idle",
+                          message=f"Outside entry window (09:45-14:30){holding}")
             return None
 
         expiry_s = market_snapshot.get("expiry")
@@ -97,16 +123,22 @@ class AIOptionsAgent(BaseStrategy):
         best = preds[side]
         leg = row[side]
         confident = best > self.threshold
-        state = dict(status="watching", strike=row["strike"], pred_ce=round(preds["ce"], 4),
-                     pred_pe=round(preds["pe"], 4), best_side=side.upper(), best_symbol=leg.get("trading_symbol"),
-                     signal=confident, bar_time=candle_data.get("time"))
+        state = dict(status="in_trade" if open_after_exits else "watching", strike=row["strike"],
+                     pred_ce=round(preds["ce"], 4), pred_pe=round(preds["pe"], 4), best_side=side.upper(),
+                     best_symbol=leg.get("trading_symbol"), signal=confident, bar_time=candle_time(bar_minute, now))
 
         if not confident:
             self._publish(**state, message=f"No edge: best {side.upper()} {best * 100:+.2f}% "
-                                            f"vs threshold {self.threshold * 100:+.2f}%")
+                                            f"vs threshold {self.threshold * 100:+.2f}%{holding}")
             return None
         if self.trades_today >= self.max_trades:
-            self._publish(**state, message="Signal, but daily trade limit reached")
+            self._publish(**state, message=f"Signal, but daily trade limit reached{holding}")
+            return None
+        if open_after_exits >= self.max_open:
+            self._publish(**state, message=f"Signal, but already holding {self.max_open} trades (the maximum)")
+            return None
+        if leg["instrument_key"] in held_keys:
+            self._publish(**state, message=f"Signal on {leg.get('trading_symbol')}, already held{holding}")
             return None
         if self.mode != "auto":
             self._publish(**state, message=f"SUGGESTION: BUY {leg.get('trading_symbol')} (suggest-only mode)")
@@ -114,8 +146,9 @@ class AIOptionsAgent(BaseStrategy):
 
         price = float(leg.get("ask") or leg["ltp"])
         self.trades_today += 1
-        self.entry = {"key": leg["instrument_key"], "minute": minute_now, "price": price}
-        self._publish(**state, message=f"BUY {leg.get('trading_symbol')} @ ~{price:.2f}")
+        self.entries[leg["instrument_key"]] = {"minute": minute_now, "price": price}
+        self._publish(**state, message=f"BUY {leg.get('trading_symbol')} @ ~{price:.2f} "
+                                       f"(trade {self.trades_today}/{self.max_trades} today)")
         logger.info(f"AI entry {leg.get('trading_symbol')} pred={best:.4f} thr={self.threshold:.4f}")
         return {
             "action": "BUY",
@@ -133,23 +166,17 @@ class AIOptionsAgent(BaseStrategy):
 
     def _manage_exit(self, pos: Dict[str, Any], minute_now: int) -> Optional[Dict[str, Any]]:
         key = pos["instrument_key"]
-        if not self.entry or self.entry["key"] != key:
+        if key not in self.entries:
             # restarted mid-trade: rebuild entry state from the position (hold clock restarts now)
-            self.entry = {"key": key, "minute": minute_now, "price": float(pos["average_price"])}
+            self.entries[key] = {"minute": minute_now, "price": float(pos["average_price"])}
+        e = self.entries[key]
         q = in_memory_quotes.get(key) or {}
         ltp = q.get("bid") or q.get("ltp")
         bars = minute_bars.get(key) or []
         last_bar = bars[-2] if len(bars) >= 2 else None  # last fully closed minute of the held option
-        reason = agent.exit_reason(entry_price=self.entry["price"], bar=last_bar, ltp=ltp,
-                                   held_minutes=minute_now - self.entry["minute"], minute_now=minute_now,
-                                   sim=self.sim)
-        pnl_pct = (ltp / self.entry["price"] - 1) * 100 if ltp else None
-        self._publish(status="in_trade", message=f"Holding {pos['trading_symbol']}"
-                      + (f" ({pnl_pct:+.1f}%)" if pnl_pct is not None else ""),
-                      symbol=pos["trading_symbol"], entry_price=self.entry["price"],
-                      stop=round(self.entry["price"] * (1 - self.sim["stop_pct"]), 2),
-                      target=round(self.entry["price"] * (1 + self.sim["target_pct"]), 2))
-        if not reason or pos["quantity"] <= 0:
+        reason = agent.exit_reason(entry_price=e["price"], bar=last_bar, ltp=ltp,
+                                   held_minutes=minute_now - e["minute"], minute_now=minute_now, sim=self.sim)
+        if not reason:
             return None
         logger.info(f"AI exit {pos['trading_symbol']} reason={reason}")
         return {
@@ -158,8 +185,12 @@ class AIOptionsAgent(BaseStrategy):
             "trading_symbol": pos["trading_symbol"],
             "quantity": abs(pos["quantity"]),
             "product_type": self.product_type,
-            "journal": {"exit_reason": reason, "entry_price": self.entry["price"], "exit_ltp": ltp},
+            "journal": {"exit_reason": reason, "entry_price": e["price"], "exit_ltp": ltp},
         }
+
+
+def candle_time(bar_minute: int, now: datetime) -> str:
+    return f"{now.date().isoformat()} {bar_minute // 60:02d}:{bar_minute % 60:02d}"
 
 
 StrategyRegistry.register("aiOptionsAgent", AIOptionsAgent)

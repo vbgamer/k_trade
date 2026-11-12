@@ -438,7 +438,8 @@ export default function AILab({ apiBase, token }) {
                 <dt>Exit rule</dt><dd>{model.exit_rule.name}: target +{model.exit_rule.target_pct}%, stop −{model.exit_rule.stop_pct}%, else hold to 15:15</dd>
                 <dt>Entry threshold</dt><dd>predicted reward &gt; {pct(model.threshold_pct, 3)}</dd>
                 <dt>Max trades / day</dt><dd>{model.max_trades_per_day}</dd>
-                <dt>Entry window</dt><dd>09:45 – 14:30, one position at a time</dd>
+                <dt>Entry window</dt><dd>09:45 – 14:30</dd>
+                <dt>Open at once (live)</dt><dd>up to 3 trades, never the same contract twice (set when starting the agent). The backtests below hold one at a time; with 3 open the test year made +₹55,242 but the worst drawdown doubled to ₹53,722.</dd>
                 <dt>Costs in rewards</dt><dd>slippage {(data.meta?.sim?.slippage_pct ?? 0) * 100}% · taxes {(data.meta?.sim?.taxes_pct ?? 0) * 100}% · brokerage ₹{data.meta?.sim?.brokerage_rs} · lot {data.meta?.sim?.lot_size}</dd>
               </dl>
               <h4>Data</h4>
